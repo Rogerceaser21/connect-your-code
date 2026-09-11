@@ -36,6 +36,17 @@ interface Participant {
   email: string;
 }
 
+/**
+ * The segmented transcriber's progress ledger (focusos_meetings.transcript_segments).
+ * Written segment by segment while the worker runs: `total` is the planned segment
+ * count, `texts` holds one entry per finished segment keyed by its index. Either half
+ * can be missing — the column is null until the worker has planned the run.
+ */
+interface TranscriptSegments {
+  total?: number;
+  texts?: Record<string, string>;
+}
+
 interface Meeting {
   id: string;
   title: string;
@@ -47,7 +58,21 @@ interface Meeting {
   updated_at?: string;
   processing_status?: string;
   processing_error?: string | null;
+  transcript_segments?: TranscriptSegments | null;
 }
+
+/**
+ * done/total for a transcript_segments blob, or null when the run has no plan yet
+ * (column null, no `total`, or a nonsense total). `done` counts the segments that
+ * already carry text, so it is 0 on a freshly planned run rather than null.
+ */
+const segmentProgress = (segments: unknown): { done: number; total: number } | null => {
+  if (!segments || typeof segments !== 'object') return null;
+  const { total, texts } = segments as TranscriptSegments;
+  if (typeof total !== 'number' || !Number.isFinite(total) || total <= 0) return null;
+  const done = texts && typeof texts === 'object' ? Object.keys(texts).length : 0;
+  return { done, total };
+};
 
 interface Project {
   id: string;
@@ -59,7 +84,7 @@ type RecordingState = 'idle' | 'recording' | 'processing' | 'done';
 
 const PROCESSING_LABELS: Record<string, { label: string; progress: number }> = {
   uploading: { label: 'Uploading audio to AI...', progress: 20 },
-  transcribing: { label: 'Transcribing your meeting...', progress: 50 },
+  transcribing: { label: 'Transcribing...', progress: 50 },
   summarizing: { label: 'Generating summary...', progress: 80 },
   done: { label: 'Complete!', progress: 100 },
   error: { label: 'Processing failed', progress: 0 },
@@ -106,6 +131,7 @@ const Meetings = () => {
       action_items: Array.isArray(m.action_items) ? m.action_items : [],
       processing_status: m.processing_status || 'done',
       processing_error: m.processing_error || null,
+      transcript_segments: m.transcript_segments ?? null,
     }));
   });
   const [meetings, setMeetings] = useState<Meeting[]>(warmMeetings ?? []);
@@ -149,6 +175,9 @@ const Meetings = () => {
   // Async processing polling state
   const [processingMeetingId, setProcessingMeetingId] = useState<string | null>(null);
   const [processingStatus, setProcessingStatus] = useState<string>('uploading');
+  // done/total for the in-flight transcription, or null while the segment plan is
+  // unknown — the banner falls back to the count-less label then.
+  const [processingProgress, setProcessingProgress] = useState<{ done: number; total: number } | null>(null);
 
   // Orphaned session recovery
   const [orphanedSession, setOrphanedSession] = useState<{ id: string; chunkCount: number; createdAt: string; gcsFolder: string; mimeType: string } | null>(null);
@@ -183,6 +212,7 @@ const Meetings = () => {
             action_items: Array.isArray(m.action_items) ? m.action_items : [],
             processing_status: m.processing_status || 'done',
             processing_error: m.processing_error || null,
+            transcript_segments: m.transcript_segments ?? null,
           }))
         );
         setLoading(false);
@@ -313,7 +343,7 @@ const Meetings = () => {
     const poll = async () => {
       const { data, error } = await (supabase as any)
         .from('focusos_meetings')
-        .select('processing_status, processing_error')
+        .select('processing_status, processing_error, transcript_segments')
         .eq('id', processingMeetingId)
         .single();
 
@@ -323,6 +353,10 @@ const Meetings = () => {
       const procError = (data as any).processing_error as string | null;
 
       setProcessingStatus(status);
+      // Segment ledger -> "Transcribing 3/8". Null whenever the worker has not
+      // planned the run yet, which is also what clears the count on the way out
+      // of 'transcribing'.
+      setProcessingProgress(segmentProgress((data as any).transcript_segments));
 
       if (status === 'done') {
         if (pollingRef.current) clearInterval(pollingRef.current);
@@ -330,12 +364,14 @@ const Meetings = () => {
         toast.success('Meeting processed successfully!');
         navigate(`/meetings/${processingMeetingId}`);
         setProcessingMeetingId(null);
+        setProcessingProgress(null);
         setRecordingState('idle');
       } else if (status === 'error') {
         if (pollingRef.current) clearInterval(pollingRef.current);
         pollingRef.current = null;
         toast.error(`Processing failed: ${procError || 'Unknown error'}`);
         setProcessingMeetingId(null);
+        setProcessingProgress(null);
         setRecordingState('idle');
         fetchMeetings({ fresh: true });
       }
@@ -451,6 +487,9 @@ const Meetings = () => {
         action_items: Array.isArray(m.action_items) ? m.action_items : [],
         processing_status: (m as any).processing_status || 'done',
         processing_error: (m as any).processing_error || null,
+        // Kept explicitly (select('*') returns it) so an in-flight row's card pill
+        // can count segments without waiting for the single-row poll.
+        transcript_segments: (m as any).transcript_segments ?? null,
       }))
     );
 
@@ -724,20 +763,23 @@ const Meetings = () => {
     }
   };
 
-  const triggerTranscription = async (meetingData: any) => {
+  /**
+   * Kick the segmented transcriber. Its whole contract is the meeting id: the worker
+   * reads the recording path, the participants and the segment plan off the row
+   * itself, and ignores every other field. `retry: true` is the only extra — it tells
+   * the worker this is a Retry, not a fresh run.
+   */
+  const triggerTranscription = async (
+    meetingData: { id: string },
+    opts?: { retry?: boolean },
+  ) => {
     try {
       console.log('Frontend triggering transcribe-meeting for:', meetingData.id);
       // Don't await - let it run in background while we poll
       supabase.functions.invoke('focusos-transcribe-meeting', {
-        body: {
-          meetingId: meetingData.id,
-          geminiFileUri: meetingData.geminiFileUri,
-          mimeType: meetingData.mimeType,
-          participantNames: meetingData.participantNames || [],
-          durationSeconds: meetingData.durationSeconds || 0,
-          gcsBucket: meetingData.gcsBucket,
-          gcsFolder: meetingData.gcsFolder,
-        },
+        body: opts?.retry
+          ? { meetingId: meetingData.id, retry: true }
+          : { meetingId: meetingData.id },
       }).catch(err => {
         // This may "fail" due to timeout but the function keeps running server-side
         console.log('transcribe-meeting invoke completed or timed out (expected):', err?.message);
@@ -761,49 +803,40 @@ const Meetings = () => {
 
       if (error || !meetingData) throw new Error('Could not fetch meeting data');
 
-      const geminiFileUri = (meetingData as any).gemini_file_uri;
       const recordingGcsPath = (meetingData as any).recording_gcs_path as string;
 
+      // The recording in GCS is the only thing a retry needs. There is no expiring
+      // upload handle any more, so a row that still has its audio is ALWAYS retryable.
       if (!recordingGcsPath) {
         toast.error('No recording found for this meeting. Cannot retry.');
         return;
       }
 
-      // If we still have a Gemini file URI, try transcribe-meeting directly
-      if (geminiFileUri) {
-        // Extract bucket and folder from recording_gcs_path (gs://bucket/folder/recording.webm)
-        const gcsMatch = recordingGcsPath.match(/gs:\/\/([^/]+)\/(.+)\/recording\./);
-        if (!gcsMatch) {
-          toast.error('Could not parse recording path for retry.');
-          return;
-        }
+      // Reset status + retry counter so the new transcribe call gets a fresh budget,
+      // and PROVE it landed: on 2026-09-09 a Retry left gemini_transcribe_attempts at
+      // 4, so the worker refused the run it had just been asked to make. A failed
+      // reset means no invoke at all.
+      const { error: resetError } = await (supabase as any)
+        .from('focusos_meetings')
+        .update({
+          processing_status: 'transcribing',
+          processing_error: null,
+          gemini_transcribe_attempts: 0,
+        })
+        .eq('id', meeting.id);
 
-        // Reset status + retry counter so the new transcribe call gets a fresh budget.
-        await (supabase as any)
-          .from('focusos_meetings')
-          .update({
-            processing_status: 'transcribing',
-            processing_error: null,
-            gemini_transcribe_attempts: 0,
-          })
-          .eq('id', meeting.id);
-
-        setProcessingMeetingId(meeting.id);
-        setProcessingStatus('transcribing');
-        setRecordingState('processing');
-
-        triggerTranscription({
-          id: meeting.id,
-          geminiFileUri,
-          mimeType: 'audio/webm',
-          participantNames: [],
-          durationSeconds: meeting.duration_seconds || 0,
-          gcsBucket: gcsMatch[1],
-          gcsFolder: gcsMatch[2],
-        });
-      } else {
-        toast.error('Gemini file expired. This meeting needs to be re-recorded.');
+      if (resetError) {
+        console.error('Retry reset failed:', resetError);
+        toast.error('Could not reset the meeting for retry');
+        return;
       }
+
+      setProcessingMeetingId(meeting.id);
+      setProcessingStatus('transcribing');
+      setProcessingProgress(null);
+      setRecordingState('processing');
+
+      triggerTranscription({ id: meeting.id }, { retry: true });
     } catch (err) {
       console.error('Retry error:', err);
       toast.error('Failed to retry processing.');
@@ -841,6 +874,12 @@ const Meetings = () => {
   }
 
   const processingInfo = PROCESSING_LABELS[processingStatus] || PROCESSING_LABELS.uploading;
+  // "Transcribing 3/8" the moment the worker has a segment plan, the count-less
+  // label until then. Every other status keeps its own wording.
+  const processingBannerLabel =
+    processingStatus === 'transcribing' && processingProgress
+      ? `Transcribing ${processingProgress.done}/${processingProgress.total}`
+      : processingInfo.label;
 
   return (
     <>
@@ -1033,7 +1072,7 @@ const Meetings = () => {
             <div className="flex items-center gap-3 mb-3">
               <Loader2 className="h-6 w-6 animate-spin text-primary shrink-0" />
               <div className="flex-1">
-                <p className="font-semibold">{processingInfo.label}</p>
+                <p className="font-semibold" data-processing-banner-label>{processingBannerLabel}</p>
                 <p className="text-sm text-muted-foreground">
                   This may take a few minutes for long recordings
                 </p>
@@ -1116,11 +1155,16 @@ const Meetings = () => {
                 meeting.processing_status !== 'error';
               const minutesSinceUpdate = Math.floor((Date.now() - updatedAt) / 60000);
               const isLong = isProcessing && minutesSinceUpdate >= 2;
+              // The row's own segment ledger, so an in-flight card counts progress
+              // without the single-row poll (which only follows ONE meeting).
+              const rowProgress = segmentProgress(meeting.transcript_segments);
               const processingLabel =
                 meeting.processing_status === 'summarizing'
                   ? 'Summarizing'
                   : meeting.processing_status === 'transcribing'
-                    ? (isLong ? `Transcribing (${minutesSinceUpdate}m)` : 'Transcribing')
+                    ? rowProgress
+                      ? `Transcribing ${rowProgress.done}/${rowProgress.total}`
+                      : (isLong ? `Transcribing (${minutesSinceUpdate}m)` : 'Transcribing...')
                     : 'Processing';
               return (
                 <Card
@@ -1142,6 +1186,7 @@ const Meetings = () => {
                           {isProcessing && (
                             <Badge
                               variant="secondary"
+                              data-processing-pill
                               className={`text-xs shrink-0 gap-1 ${isLong ? 'bg-amber-500/15 text-amber-600 border-amber-500/30' : ''}`}
                               title={isLong ? 'Transcription is taking longer than usual. Will auto-retry up to 3 times.' : undefined}
                             >
