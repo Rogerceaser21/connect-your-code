@@ -408,6 +408,7 @@ export type Database = {
           summary: string | null
           title: string
           transcript_gcs_path: string | null
+          transcript_segments: Json | null
           transcription_text: string | null
           updated_at: string
           user_id: string
@@ -430,6 +431,7 @@ export type Database = {
           summary?: string | null
           title?: string
           transcript_gcs_path?: string | null
+          transcript_segments?: Json | null
           transcription_text?: string | null
           updated_at?: string
           user_id: string
@@ -452,6 +454,7 @@ export type Database = {
           summary?: string | null
           title?: string
           transcript_gcs_path?: string | null
+          transcript_segments?: Json | null
           transcription_text?: string | null
           updated_at?: string
           user_id?: string
