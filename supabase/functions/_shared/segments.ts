@@ -13,11 +13,48 @@ export interface SegmentPlan {
   lastChunk: number;
 }
 
-/** The lease a worker takes while it transcribes one segment. */
+/**
+ * The lease a worker takes while it transcribes one segment.
+ *
+ * ALWAYS an object, NEVER null: the lease filters are PLAIN PostgREST filters on
+ * the jsonb path (`transcript_segments->lease->>until` / `->>token`), because any
+ * `or=(...)` / `and=(...)` logic tree on a PATCH is rejected by this project's
+ * PostgREST with 42703 "column ... does not exist" (live-probed 2026-09-11, the
+ * same filter on a GET is 200). A plain filter cannot say "is null OR expired",
+ * and a NULL on the left of `<` matches nothing, so a released lease is written
+ * as the SENTINEL (see releasedLease) instead of null.
+ */
 export interface SegmentLease {
+  /** The segment this lease covers; -1 in the released sentinel. */
   segment: number;
   /** ISO timestamp (or epoch ms) after which the lease is dead. */
   until: string | number;
+  /**
+   * Random per-take id. The ONLY thing that proves a write belongs to the worker
+   * that took the lease: `->>token = <mine>` is one plain filter, evaluated
+   * inside Postgres at write time.
+   */
+  token: string;
+}
+
+/**
+ * `until` of the released sentinel: the epoch, so it is in the past forever and
+ * sorts BEFORE any real timestamp as TEXT too (PostgREST compares a `->>` path
+ * as text, and toISOString() is fixed-width, so lexical order === chronological
+ * order).
+ */
+export const RELEASED_LEASE_UNTIL = "1970-01-01T00:00:00.000Z";
+
+/**
+ * A FRESH released-lease sentinel: "no worker holds this meeting".
+ *
+ * A function, not a shared const, so no caller can mutate the value every other
+ * write depends on. segment -1 (no segment) + an epoch `until` (expired) + an
+ * empty token (matches nobody's write), which is exactly what takeLease's
+ * `->>until < now` filter needs to see to grant the lease.
+ */
+export function releasedLease(): SegmentLease {
+  return { segment: -1, until: RELEASED_LEASE_UNTIL, token: "" };
 }
 
 /** Shape of focusos_meetings.transcript_segments. */
@@ -29,7 +66,17 @@ export interface SegmentsState {
   texts: Record<string, string>;
   attempts: Record<string, number>;
   resumes: number;
+  /**
+   * Nullable for READS only (a legacy row, or a row planned before the sentinel
+   * rule). Nothing ever WRITES null here — see SegmentLease / releasedLease.
+   */
   lease: SegmentLease | null;
+  /**
+   * Set to "webm" once chunk 00000 has been PROVEN to carry the EBML magic.
+   * Absent on a row whose container was never sniffed, which is what makes the
+   * worker download chunk 0 once and fail fast on an mp4 recording.
+   */
+  format?: "webm";
 }
 
 export const DEFAULT_SEGMENT_CHUNKS = 20; // 20 x 30 s = 10 min of audio per Gemini call
@@ -181,17 +228,44 @@ export function countMissingSegments(
   return missing;
 }
 
-/** True only while a lease exists and its `until` is still in the future. */
+/**
+ * True only while a REAL lease exists and its `until` is still in the future.
+ *
+ * The released sentinel (segment -1, `until` at the epoch) is NOT valid, and a
+ * negative segment is rejected whatever its `until` says: the sentinel means "no
+ * worker holds this meeting", so it must never read as busy.
+ */
 export function leaseIsValid(
   lease: SegmentLease | null | undefined,
   nowMs: number,
 ): boolean {
   if (!lease || lease.until === null || lease.until === undefined) return false;
+  if (typeof lease.segment === "number" && lease.segment < 0) return false;
   const until = typeof lease.until === "number"
     ? lease.until
     : Date.parse(String(lease.until));
   if (!Number.isFinite(until)) return false;
   return until > nowMs;
+}
+
+/**
+ * Split focusos_meetings.recording_gcs_path into its bucket and recording folder.
+ *
+ * TWO shapes exist in production, both written by focusos-process-meeting:
+ *   gs://<bucket>/<folder>/recording.webm      multi-chunk recordings (composed)
+ *   gs://<bucket>/<folder>/chunks/00000.webm   chunk_count === 1, i.e. under
+ *                                              ~30 s: compose is skipped and the
+ *                                              single chunk IS the recording.
+ * Returns null for anything else (a caller turns that into a readable error).
+ */
+export function parseRecordingPath(
+  path: string | null | undefined,
+): { bucket: string; folder: string } | null {
+  const match = String(path ?? "").match(
+    /^gs:\/\/([^/]+)\/(.+?)\/(?:recording\.[^/]+|chunks\/\d{5}\.webm)$/,
+  );
+  if (!match) return null;
+  return { bucket: match[1], folder: match[2] };
 }
 
 /** GCS object name of chunk `i` inside a recording folder. */
@@ -257,13 +331,23 @@ export function buildSegmentPrompt(
 export const NO_SPEECH_TEXT = "(no speech in this part)";
 
 /**
+ * Appended to a segment whose Gemini response hit the output-token cap. It is
+ * part of the stored transcript on purpose: a reader must be able to see where
+ * the words stop, and the join step keeps the marker in place.
+ */
+export const TRUNCATED_MARKER = "[transcript truncated: output limit]";
+
+/**
  * Pull the transcript out of a Gemini generateContent response body (callers
  * check resp.ok first, so this only ever sees a 200 body).
  *
  *  - no candidates                      -> error (quota/safety block on the prompt)
- *  - finishReason present and not STOP  -> error naming the reason
- *    (SAFETY / RECITATION / MAX_TOKENS: the text, if any, is not a transcript
- *     of the whole segment, so it must not be stored as one)
+ *  - MAX_TOKENS WITH text               -> that text + TRUNCATED_MARKER, and the
+ *    segment counts as DONE: ten minutes of real transcript minus its tail beats
+ *    three more identical calls that hit the same cap and fail the meeting.
+ *  - MAX_TOKENS with NO text            -> error (nothing was heard at all)
+ *  - any other non-STOP finishReason    -> error naming the reason (SAFETY /
+ *    RECITATION: the response is not a transcript)
  *  - blank text with STOP / no reason   -> NO_SPEECH_TEXT (a silent stretch)
  *  - otherwise                          -> the joined part texts
  */
@@ -285,7 +369,9 @@ export function extractTranscriptText(
   const isStop = finishReason === null || finishReason === undefined ||
     finishReason === "STOP" || finishReason === "FINISH_REASON_STOP" ||
     finishReason === "FINISH_REASON_UNSPECIFIED";
-  if (!isStop) {
+  const isMaxTokens = finishReason === "MAX_TOKENS" ||
+    finishReason === "FINISH_REASON_MAX_TOKENS";
+  if (!isStop && !isMaxTokens) {
     return { error: `Gemini stopped early (finishReason ${finishReason})` };
   }
 
@@ -293,6 +379,13 @@ export function extractTranscriptText(
   const text = Array.isArray(parts)
     ? parts.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("")
     : "";
+
+  if (isMaxTokens) {
+    // Keep what was heard, mark the cut, count the segment done.
+    if (text.trim()) return { text: `${text}\n${TRUNCATED_MARKER}` };
+    return { error: `Gemini stopped early (finishReason ${finishReason})` };
+  }
+
   if (text.trim()) return { text };
   return { text: NO_SPEECH_TEXT };
 }

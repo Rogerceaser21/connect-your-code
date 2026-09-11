@@ -12,6 +12,21 @@ import { extractTranscriptText } from "./segments.ts";
 
 const GEMINI_MODEL = "gemini-2.5-flash";
 
+/**
+ * Every Gemini call is time-boxed. WHY: a hung fetch inside a segment has no
+ * other ceiling — the lease expires, a second worker takes the segment, and the
+ * first one is still holding the socket when it writes. These caps are what the
+ * worker's LEASE_MS is sized against (compose + upload 60 s + ACTIVE 60 s +
+ * generate 120 s).
+ */
+const UPLOAD_TIMEOUT_MS = 60_000;   // the WHOLE GCS -> Gemini transfer
+const STATUS_TIMEOUT_MS = 10_000;   // one files.get poll
+const GENERATE_TIMEOUT_MS = 120_000; // one generateContent call
+const DELETE_TIMEOUT_MS = 10_000;
+
+/** Output cap for a transcription call: ~10 min of speech needs far less. */
+const TRANSCRIBE_MAX_OUTPUT_TOKENS = 16384;
+
 /* ─── File API ──────────────────────────────────────────────────── */
 
 export async function uploadToGeminiFileAPI(
@@ -22,11 +37,15 @@ export async function uploadToGeminiFileAPI(
   mimeType: string,
   displayName: string
 ): Promise<string> {
+  // ONE deadline for the whole transfer (metadata, init, every PUT and the GCS
+  // read stream that feeds them), so this function can never outlive the lease.
+  const signal = AbortSignal.timeout(UPLOAD_TIMEOUT_MS);
+
   // Step 1: Get file size from GCS metadata (no download)
   const encodedPath = encodeURIComponent(gcsObjectPath);
   const metaResp = await fetch(
     `https://storage.googleapis.com/storage/v1/b/${gcsBucket}/o/${encodedPath}`,
-    { headers: { Authorization: `Bearer ${gcsToken}` } }
+    { headers: { Authorization: `Bearer ${gcsToken}` }, signal }
   );
   if (!metaResp.ok) {
     const err = await metaResp.text();
@@ -51,6 +70,7 @@ export async function uploadToGeminiFileAPI(
       body: JSON.stringify({
         file: { display_name: displayName },
       }),
+      signal,
     }
   );
 
@@ -67,7 +87,7 @@ export async function uploadToGeminiFileAPI(
   const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB chunks
   const downloadResp = await fetch(
     `https://storage.googleapis.com/storage/v1/b/${gcsBucket}/o/${encodedPath}?alt=media`,
-    { headers: { Authorization: `Bearer ${gcsToken}` } }
+    { headers: { Authorization: `Bearer ${gcsToken}` }, signal }
   );
   if (!downloadResp.ok || !downloadResp.body) {
     throw new Error(`GCS download failed: ${await downloadResp.text()}`);
@@ -105,6 +125,7 @@ export async function uploadToGeminiFileAPI(
           "X-Goog-Upload-Command": command,
         },
         body: chunk as unknown as BodyInit,
+        signal,
       });
 
       if (!uploadResp.ok) {
@@ -154,7 +175,8 @@ export async function waitForGeminiFileActive(
 
   while (Date.now() < deadline) {
     const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`
+      `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`,
+      { signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) }
     );
     if (!resp.ok) {
       const err = await resp.text();
@@ -175,7 +197,7 @@ export async function deleteGeminiFile(apiKey: string, fileUri: string): Promise
   const fileName = geminiFileName(fileUri);
   await fetch(
     `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`,
-    { method: "DELETE" }
+    { method: "DELETE", signal: AbortSignal.timeout(DELETE_TIMEOUT_MS) }
   );
 }
 
@@ -186,8 +208,11 @@ export async function deleteGeminiFile(apiKey: string, fileUri: string): Promise
  *
  * A 200 whose candidate finished normally with no words in it is a SILENT
  * segment, not a failure: extractTranscriptText hands back NO_SPEECH_TEXT so
- * the segment counts as done. Everything else (non-200, no candidates, an
- * early finishReason such as SAFETY / RECITATION / MAX_TOKENS) still throws.
+ * the segment counts as done. MAX_TOKENS WITH text keeps that text plus a
+ * truncation marker. Everything else (non-200, no candidates, SAFETY /
+ * RECITATION, MAX_TOKENS with no text at all) still throws.
+ *
+ * Bounded by GENERATE_TIMEOUT_MS: a segment must never outlive its lease.
  */
 export async function transcribeSegment(
   apiKey: string,
@@ -209,7 +234,23 @@ export async function transcribeSegment(
             ],
           },
         ],
+        // temperature 0: a transcript is not a creative task, and a rerun of a
+        // failed segment should produce the same words as the run before it.
+        //
+        // thinkingBudget 0: gemini-2.5-flash spends its output budget on thinking
+        // tokens before it writes a word, which is how a 10 minute segment came
+        // back MAX_TOKENS with an EMPTY candidate. With thinking off the same call
+        // returns the full transcript (evidence handoff/evidence/mt0/
+        // gemini-seg0-cfg-think-off.txt and gemini-segB-cfg-think-off.txt, which
+        // were captured with exactly this generationConfig). The SUMMARY call is
+        // left alone: it is short, and its reasoning earns its tokens.
+        generationConfig: {
+          maxOutputTokens: TRANSCRIBE_MAX_OUTPUT_TOKENS,
+          temperature: 0,
+          thinkingConfig: { thinkingBudget: 0 },
+        },
       }),
+      signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
     }
   );
 
@@ -333,6 +374,7 @@ export async function generateSummary(
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: { responseMimeType: "application/json" },
       }),
+      signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
     }
   );
   if (!resp.ok) {

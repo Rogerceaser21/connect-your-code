@@ -1,7 +1,12 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { generateSummary } from "../_shared/gemini.ts";
-import { leaseIsValid, scrubSecrets, type SegmentsState } from "../_shared/segments.ts";
+import {
+  leaseIsValid,
+  releasedLease,
+  scrubSecrets,
+  type SegmentsState,
+} from "../_shared/segments.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -86,7 +91,11 @@ serve(async (req) => {
           }
 
           const resumes = (segments?.resumes ?? 0) + 1;
-          const nextSegments = { ...(segments ?? {}), resumes };
+          // The RELEASED SENTINEL, never null: the worker's takeLease filter is
+          // `transcript_segments->lease->>until < now` and a null there matches no
+          // row, so a poller that nulled the lease key would hand the worker a
+          // meeting it could never lease.
+          const nextSegments = { ...(segments ?? {}), resumes, lease: releasedLease() };
 
           if (resumes > MAX_RESUMES) {
             console.log(`[poller] giving up on ${row.id} after ${resumes - 1} resumes`);
@@ -97,7 +106,7 @@ serve(async (req) => {
               supabaseServiceKey,
               GEMINI_API_KEY,
             ]).trim();
-            await supabase
+            const { data: failed, error: failErr } = await supabase
               .from("focusos_meetings")
               .update({
                 processing_status: "error",
@@ -108,15 +117,45 @@ serve(async (req) => {
               })
               .eq("id", row.id)
               // Never flip a meeting that finished in the meantime.
-              .eq("processing_status", "transcribing");
+              .eq("processing_status", "transcribing")
+              // …and never one that MOVED since this tick read it: the row must
+              // still be as stale as it was in the candidate query (writes to
+              // focusos_meetings bump updated_at), or a worker that just resumed
+              // it would be failed under its feet.
+              .lt("updated_at", cutoff)
+              .select("id");
+            if (failErr) {
+              console.warn(`[poller] ${row.id}: give-up write error — ${failErr.message}`);
+            } else if (!failed || failed.length === 0) {
+              console.log(`[poller] ${row.id}: moved since the read — not failing it this tick`);
+            }
             continue;
           }
 
-          console.log(`[poller] resuming segmented transcription for ${row.id} (resume ${resumes}/${MAX_RESUMES})`);
-          await supabase
+          /* The resumes counter is the poller's give-up budget, so the write that
+           * increments it must be CONDITIONAL on the row not having moved since
+           * the read above: a status still 'transcribing' AND an updated_at still
+           * older than this tick's cutoff. Without that, a worker that woke up
+           * between the read and the write (or a second poller chain) gets a
+           * resume charged against it every tick and a healthy meeting is failed
+           * at 12. 0 rows affected -> another chain or the worker owns this row,
+           * so skip it entirely this tick and do NOT invoke the worker.        */
+          const { data: bumped, error: bumpErr } = await supabase
             .from("focusos_meetings")
             .update({ transcript_segments: nextSegments })
-            .eq("id", row.id);
+            .eq("id", row.id)
+            .eq("processing_status", "transcribing")
+            .lt("updated_at", cutoff)
+            .select("id");
+          if (bumpErr) {
+            console.warn(`[poller] ${row.id}: resume write error — ${bumpErr.message}`);
+            continue;
+          }
+          if (!bumped || bumped.length === 0) {
+            console.log(`[poller] ${row.id}: moved since the read — skipping this tick`);
+            continue;
+          }
+          console.log(`[poller] resuming segmented transcription for ${row.id} (resume ${resumes}/${MAX_RESUMES})`);
 
           fetch(`${supabaseUrl}/functions/v1/focusos-transcribe-meeting`, {
             method: "POST",

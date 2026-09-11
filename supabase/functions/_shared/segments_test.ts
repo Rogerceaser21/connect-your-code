@@ -15,11 +15,15 @@ import {
   leadObjectName,
   leaseIsValid,
   NO_SPEECH_TEXT,
+  parseRecordingPath,
   planSegments,
+  RELEASED_LEASE_UNTIL,
+  releasedLease,
   scrubSecrets,
   segmentObjectName,
   segmentStartSeconds,
   segmentsPrefix,
+  TRUNCATED_MARKER,
 } from "./segments.ts";
 
 /** A generateContent 200 body with one candidate. */
@@ -138,15 +142,70 @@ Deno.test("leaseIsValid: null, past and future", () => {
   assertEquals(leaseIsValid(null, now), false);
   assertEquals(leaseIsValid(undefined, now), false);
   assertEquals(
-    leaseIsValid({ segment: 0, until: new Date(now - 1000).toISOString() }, now),
+    leaseIsValid({ segment: 0, until: new Date(now - 1000).toISOString(), token: "t" }, now),
     false,
   );
   assertEquals(
-    leaseIsValid({ segment: 0, until: new Date(now + 180_000).toISOString() }, now),
+    leaseIsValid({ segment: 0, until: new Date(now + 180_000).toISOString(), token: "t" }, now),
     true,
   );
-  assertEquals(leaseIsValid({ segment: 0, until: now + 5 }, now), true);
-  assertEquals(leaseIsValid({ segment: 0, until: "not-a-date" }, now), false);
+  assertEquals(leaseIsValid({ segment: 0, until: now + 5, token: "t" }, now), true);
+  assertEquals(leaseIsValid({ segment: 0, until: "not-a-date", token: "t" }, now), false);
+});
+
+Deno.test("leaseIsValid: the RELEASED SENTINEL is never valid", () => {
+  const now = Date.UTC(2026, 8, 11, 12, 0, 0);
+  // the sentinel a release / plan / poller resume writes instead of null
+  assertEquals(leaseIsValid(releasedLease(), now), false);
+  assertEquals(
+    leaseIsValid({ segment: -1, until: RELEASED_LEASE_UNTIL, token: "" }, now),
+    false,
+  );
+  // a negative segment is not valid even with a FUTURE until: "no segment" wins
+  assertEquals(
+    leaseIsValid({ segment: -1, until: new Date(now + 300_000).toISOString(), token: "x" }, now),
+    false,
+  );
+  // …and the sentinel is still valid-looking for segment 0 when it is real
+  assertEquals(
+    leaseIsValid({ segment: 0, until: new Date(now + 300_000).toISOString(), token: "x" }, now),
+    true,
+  );
+});
+
+Deno.test("releasedLease: shape, freshness, and TEXT-order proof", () => {
+  assertEquals(releasedLease(), { segment: -1, until: RELEASED_LEASE_UNTIL, token: "" });
+  assertEquals(RELEASED_LEASE_UNTIL, "1970-01-01T00:00:00.000Z");
+  // a FRESH object every call: nothing can mutate the value other writes rely on
+  const a = releasedLease();
+  const b = releasedLease();
+  assertEquals(a === b, false);
+  a.segment = 99;
+  assertEquals(releasedLease().segment, -1);
+  // PostgREST compares `lease->>until` as TEXT, so the sentinel must sort BEFORE
+  // any real timestamp lexically — that is what makes `->>until < now` grant the
+  // lease on a released meeting (a null there would match no row at all).
+  const nowIso = new Date(Date.UTC(2026, 8, 11, 12, 0, 0)).toISOString();
+  assertEquals(RELEASED_LEASE_UNTIL < nowIso, true);
+  assertEquals(new Date(Date.UTC(1999, 0, 1)).toISOString() < nowIso, true);
+  // a LIVE lease's until sorts after now, so its row is NOT matched
+  const liveIso = new Date(Date.UTC(2026, 8, 11, 12, 5, 0)).toISOString();
+  assertEquals(liveIso < nowIso, false);
+});
+
+Deno.test("leaseIsValid: a token-bearing live lease is valid, token value is irrelevant", () => {
+  const now = Date.UTC(2026, 8, 11, 12, 0, 0);
+  const until = new Date(now + 300_000).toISOString();
+  assertEquals(leaseIsValid({ segment: 3, until, token: crypto.randomUUID() }, now), true);
+  assertEquals(leaseIsValid({ segment: 3, until, token: "" }, now), true);
+  // an EXPIRED lease stays invalid however good its token looks
+  assertEquals(
+    leaseIsValid(
+      { segment: 3, until: new Date(now - 1).toISOString(), token: crypto.randomUUID() },
+      now,
+    ),
+    false,
+  );
 });
 
 Deno.test("chunkObjectName: 5-digit zero padding", () => {
@@ -168,6 +227,44 @@ Deno.test("object names: init, segments prefix, segment and lead", () => {
   assertEquals(segmentObjectName("user/ts", 7), "user/ts/segments/07.webm");
   assertEquals(leadObjectName("user/ts", 7), "user/ts/segments/07-lead.webm");
   assertEquals(leadObjectName("user/ts", 12), "user/ts/segments/12-lead.webm");
+});
+
+Deno.test("parseRecordingPath: both production shapes give the same folder", () => {
+  // composed recordings (chunk_count > 1)
+  assertEquals(
+    parseRecordingPath("gs://focusos-audio/user-42/1757500000000/recording.webm"),
+    { bucket: "focusos-audio", folder: "user-42/1757500000000" },
+  );
+  // sub-30 s recordings: chunk_count === 1, so process-meeting never composes
+  // and recording_gcs_path IS the single chunk object
+  assertEquals(
+    parseRecordingPath("gs://focusos-audio/user-42/1757500000000/chunks/00000.webm"),
+    { bucket: "focusos-audio", folder: "user-42/1757500000000" },
+  );
+  // a deeper folder, and a non-webm composed extension
+  assertEquals(
+    parseRecordingPath("gs://b/a/b/c/recording.mp4"),
+    { bucket: "b", folder: "a/b/c" },
+  );
+  // the folder is the SAME whichever shape the row holds
+  const composed = parseRecordingPath("gs://b/u/t/recording.webm");
+  const single = parseRecordingPath("gs://b/u/t/chunks/00000.webm");
+  assertEquals(composed, single);
+  // and it is exactly what the chunk-name helper expects
+  assertEquals(chunkObjectName(single!.folder, 0), "u/t/chunks/00000.webm");
+});
+
+Deno.test("parseRecordingPath: garbage, partial and nullish paths give null", () => {
+  assertEquals(parseRecordingPath("not a path at all"), null);
+  assertEquals(parseRecordingPath("https://b/u/t/recording.webm"), null);
+  assertEquals(parseRecordingPath("gs://bucket-only"), null);
+  assertEquals(parseRecordingPath("gs://b/recording.webm"), null); // no folder
+  assertEquals(parseRecordingPath("gs://b/u/t/chunks/0.webm"), null); // not 5 digits
+  assertEquals(parseRecordingPath("gs://b/u/t/chunks/00000.mp4"), null);
+  assertEquals(parseRecordingPath("gs://b/u/t/init.webm"), null);
+  assertEquals(parseRecordingPath(""), null);
+  assertEquals(parseRecordingPath(null), null);
+  assertEquals(parseRecordingPath(undefined), null);
 });
 
 Deno.test("buildSegmentPrompt: part 1 keeps the production wording, no overlap line", () => {
@@ -228,13 +325,33 @@ Deno.test("extractTranscriptText: empty + STOP (or no reason) -> silent sentinel
 });
 
 Deno.test("extractTranscriptText: a non-STOP finishReason is an error naming it", () => {
+  // MAX_TOKENS with NOTHING in it: no words were produced at all
   const empty = extractTranscriptText(geminiBody("", "MAX_TOKENS")) as { error: string };
   assertEquals(empty.error.includes("MAX_TOKENS"), true);
-  // a truncated segment is not a transcript of the segment, text or not
-  const partial = extractTranscriptText(geminiBody("half a sent", "MAX_TOKENS")) as { error: string };
-  assertEquals(partial.error.includes("MAX_TOKENS"), true);
   const unsafe = extractTranscriptText(geminiBody("", "SAFETY")) as { error: string };
   assertEquals(unsafe.error.includes("SAFETY"), true);
+  // SAFETY / RECITATION stay errors even WITH text: that text is not a transcript
+  const recited = extractTranscriptText(geminiBody("some words", "RECITATION")) as { error: string };
+  assertEquals(recited.error.includes("RECITATION"), true);
+});
+
+Deno.test("extractTranscriptText: MAX_TOKENS WITH text keeps it and marks the cut", () => {
+  const out = extractTranscriptText(geminiBody("Speaker 1: half a sent", "MAX_TOKENS")) as {
+    text: string;
+  };
+  assertEquals(out.text, `Speaker 1: half a sent\n${TRUNCATED_MARKER}`);
+  assertEquals(out.text.startsWith("Speaker 1: half a sent"), true);
+  assertEquals(out.text.includes("truncated"), true);
+  // and the segment now counts as DONE, so it is never re-transcribed
+  assertEquals(firstMissingSegment({ "0": out.text }, 1), null);
+  assertEquals(countMissingSegments({ "0": out.text }, 1), 0);
+  // the marker survives the join, so a reader sees where the words stop
+  assertEquals(joinTranscript({ "0": out.text }, 1).includes(TRUNCATED_MARKER), true);
+  // the long-form enum spelling behaves the same way
+  const alt = extractTranscriptText(
+    geminiBody("tail", "FINISH_REASON_MAX_TOKENS"),
+  ) as { text: string };
+  assertEquals(alt.text, `tail\n${TRUNCATED_MARKER}`);
 });
 
 Deno.test("extractTranscriptText: no candidates -> error (with any blockReason)", () => {
