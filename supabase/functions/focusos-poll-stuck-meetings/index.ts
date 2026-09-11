@@ -60,7 +60,16 @@ serve(async (req) => {
     for (const row of rows) {
       try {
         // Case A (legacy): a whole-file transcript is already staged → just summarize.
-        if (row.transcription_text && (!row.summary || row.processing_status === "summarizing")) {
+        // Only for rows the OLD pipeline staged: a row that carries a segment plan
+        // belongs to the segment worker even if a stale transcription_text is
+        // still on it (a legacy row re-opened by Retry), so it must not be
+        // summarised here and flipped to 'done' without a transcript_gcs_path.
+        const hasSegmentPlan = typeof (row.transcript_segments as any)?.total === "number";
+        if (
+          !hasSegmentPlan &&
+          row.transcription_text &&
+          (!row.summary || row.processing_status === "summarizing")
+        ) {
           console.log(`[poller] finishing summarization for ${row.id}`);
           const summary = await generateSummary(
             GEMINI_API_KEY,
@@ -77,7 +86,9 @@ serve(async (req) => {
               transcription_text: null,
               gemini_file_uri: null,
             })
-            .eq("id", row.id);
+            .eq("id", row.id)
+            // Guarded: the row must still be where we read it (no worker moved it).
+            .eq("processing_status", row.processing_status);
           continue;
         }
 

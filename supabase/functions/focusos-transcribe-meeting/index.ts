@@ -502,10 +502,22 @@ serve(async (req) => {
        * the failure attempts, the poller's resume budget, and any lease
        * (a retry deliberately pre-empts a worker that went quiet).      */
       state = { ...state, attempts: {}, resumes: 0, lease: releasedLease() };
-      await supabase
+      // Guarded like takeLease: a lease that went live between the row read and
+      // this write (a double Retry click, or the poller resuming at the same
+      // moment) must not be clobbered. Zero rows = someone holds it: stand down.
+      const { data: reopened, error: reopenErr } = await supabase
         .from("focusos_meetings")
         .update({ transcript_segments: state, processing_error: null })
-        .eq("id", meetingId);
+        .eq("id", meetingId)
+        .eq("processing_status", "transcribing")
+        .lt("transcript_segments->lease->>until", new Date().toISOString())
+        .select("id");
+      if (reopenErr) throw new Error(`Retry state write failed: ${reopenErr.message}`);
+      if (!reopened || reopened.length === 0) {
+        console.log(`[segment ${INSTANCE}] ${meetingId}: retry lost the race to a live lease — busy`);
+        armPoller(supabaseUrl, serviceKey, 0);
+        return json({ busy: true });
+      }
       console.log(
         `[segment ${INSTANCE}] ${meetingId}: retry — attempts/lease/resumes cleared, ` +
         `${countMissingSegments(state.texts, state.total)}/${state.total} segment(s) still missing`
@@ -846,10 +858,20 @@ serve(async (req) => {
           // We hold the lease: record the attempt AND release it (the sentinel,
           // never null) in ONE token-owned write, so a lease a second worker has
           // since taken is left exactly as it is.
-          await mergeStateOwned(leaseToken, {
+          const kept = await mergeStateOwned(leaseToken, {
             attempts: { [key]: attemptCount },
             lease: releasedLease(),
           });
+          if (!kept) {
+            // The lease is no longer ours (it expired and another worker took the
+            // segment): that worker owns the outcome now. Writing processing_error
+            // or 'error' here would stamp a failure under a healthy holder, so
+            // stand down without touching the row.
+            console.warn(
+              `[segment ${INSTANCE}] ${meetingId}: ${label} failed after the lease was lost — standing down`
+            );
+            return json({ processed, leaseLost: segmentIndex, attempt: attemptCount });
+          }
         } else {
           // No lease is held — a finalize failure (the last segment's write
           // released it) or a takeLease that threw before it was granted — so

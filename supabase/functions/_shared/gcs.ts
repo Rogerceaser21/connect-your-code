@@ -13,6 +13,9 @@ export interface ServiceAccount {
   token_uri: string;
 }
 
+/** Every GCS leg is bounded so no segment can outlive its lease on a hung call. */
+export const GCS_TIMEOUT_MS = 60_000;
+
 export async function getGcsAccessToken(sa: ServiceAccount): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
@@ -53,6 +56,7 @@ export async function getGcsAccessToken(sa: ServiceAccount): Promise<string> {
 
   const resp = await fetch(sa.token_uri, {
     method: "POST",
+    signal: AbortSignal.timeout(GCS_TIMEOUT_MS),
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
   });
@@ -77,6 +81,7 @@ export async function uploadToGcs(
     `https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o?uploadType=media&name=${encodedPath}`,
     {
       method: "POST",
+      signal: AbortSignal.timeout(GCS_TIMEOUT_MS),
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": contentType,
@@ -113,7 +118,7 @@ export async function listObjectNames(
 
     const resp = await fetch(
       `https://storage.googleapis.com/storage/v1/b/${bucket}/o?${params.toString()}`,
-      { headers: { Authorization: `Bearer ${token}` } }
+      { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(GCS_TIMEOUT_MS) }
     );
     if (!resp.ok) {
       const err = await resp.text();
@@ -164,6 +169,7 @@ export async function composeObjects(
     `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(dest)}/compose`,
     {
       method: "POST",
+      signal: AbortSignal.timeout(GCS_TIMEOUT_MS),
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
@@ -190,7 +196,7 @@ export async function downloadObject(
 ): Promise<Uint8Array> {
   const resp = await fetch(
     `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(name)}?alt=media`,
-    { headers: { Authorization: `Bearer ${token}` } }
+    { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(GCS_TIMEOUT_MS) }
   );
   if (!resp.ok) {
     const err = await resp.text();
@@ -207,7 +213,7 @@ export async function deleteObject(
 ): Promise<void> {
   const resp = await fetch(
     `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(name)}`,
-    { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }
+    { method: "DELETE", headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(GCS_TIMEOUT_MS) }
   );
   if (!resp.ok && resp.status !== 404) {
     throw new Error(`GCS delete failed for ${name}: ${await resp.text()}`);
