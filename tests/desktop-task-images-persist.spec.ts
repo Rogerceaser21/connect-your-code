@@ -31,14 +31,30 @@
 // for, so nothing is uploaded and no storage object is created; cleanup still
 // sweeps the bucket for that path in case a future change starts uploading.
 //
+// TP5 is the same data loss reached by a second door: the image read itself was
+// capped (`.limit(1000)`, no order, no filter), so on an account with more than
+// 1,000 tasks an arbitrary 1,000 came back and a row holding photos could simply
+// fall outside the window. The hydration then declared itself done, and the next
+// Save Changes wrote [] over the stored photos. The read now asks only for rows
+// that hold photos, ordered, and pages until it has them all; and the save writes
+// the `images` column only when the pane CHANGED photos, merged against the
+// stored row.
+//
 // Cases:
 //   (a) focus resync keeps the badge;
 //   (b) after (a), Edit shows (1/8) and Save Changes leaves the row at 1 image;
 //   (c) a faked warm return (hidden, +61s, visible) keeps badge and row;
-//   (d) removing the image still works: row 0 images, badge gone.
+//   (d) removing the image still works: row 0 images, badge gone;
+//   (e) a 1,100-task account: the reload's image reads carry no 1,000 cap and
+//       return every photo row (201), the badge is back, and Save keeps the photo;
+//   (f) with the image read forced empty, Save leaves the stored photos alone, and
+//       attaching one adds to them instead of replacing them.
+//
+// Cases run one at a time (playwright.config.ts: workers 1, fullyParallel off) —
+// the demo account is shared, so two runs at once would stomp each other.
 //
 // Run: PW_PORT=8094 npx playwright test tests/desktop-task-images-persist.spec.ts --project=desktop-mouse
-import { test, expect, type Page, type APIRequestContext, type Locator } from '@playwright/test';
+import { test, expect, type Page, type APIRequestContext, type Locator, type Response } from '@playwright/test';
 
 const BASE = process.env.WAVE_BASE_URL ?? '';
 
@@ -55,6 +71,15 @@ const BASELINE_PROJECTS = 3;
 const BASELINE_TASKS = 7;
 
 const IMAGE_BUCKET = 'focusos-task-images';
+
+// The image read's own signature: `select('id, images')` reaches the wire as this.
+const IMAGE_SELECT = 'select=id%2Cimages';
+
+// A valid 1 px PNG, the file case (f) attaches through the pane's file input.
+const PIXEL_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+);
 
 test.use({ actionTimeout: 15000 });
 
@@ -137,48 +162,100 @@ const restCount = async (
   return total;
 };
 
+/** Object names directly under the demo user's folder in the image bucket. */
+const listStorage = async (request: APIRequestContext, s: Session): Promise<string[]> => {
+  const res = await request.post(`${SUPABASE_URL}/storage/v1/object/list/${IMAGE_BUCKET}`, {
+    headers: restHeaders(s),
+    data: { prefix: `${s.userId}/`, limit: 1000 },
+  });
+  if (!res.ok()) return [];
+  const rows = (await res.json()) as Array<{ name?: string }>;
+  return rows
+    .map((r) => r.name ?? '')
+    .filter((n) => n !== '' && n !== '.emptyFolderPlaceholder');
+};
+
 /**
- * Delete every row this run created, PROVE each delete landed, sweep the bucket
- * for the storage path the seed named, and assert the demo account is back to
- * its pristine baseline. Never throws: it returns a list of problems, so a
- * cleanup failure can be reported without swallowing a real test failure.
+ * Seed `total` COMPLETED zz rows for the demo user, `withImages` of them holding a
+ * photo path, in batches of 500. PostgREST takes an array, but every object in one
+ * batch must carry the SAME keys, so `images` is present on all of them. Completed,
+ * so none of them renders in the open list — the image read covers completed rows
+ * too, which is exactly what makes them count here.
+ */
+const seedBulk = async (
+  request: APIRequestContext,
+  s: Session,
+  stamp: number,
+  total: number,
+  withImages: number,
+): Promise<void> => {
+  const BATCH = 500;
+  for (let from = 0; from < total; from += BATCH) {
+    const rows: Array<Record<string, unknown>> = [];
+    for (let n = from; n < Math.min(from + BATCH, total); n++) {
+      rows.push({
+        user_id: s.userId,
+        project_id: null,
+        title: `zz-bulk-${stamp}-${n}`,
+        status: 'completed',
+        priority: 'medium',
+        images: n < withImages ? [`${s.userId}/zz-persist-${n}.png`] : [],
+      });
+    }
+    const res = await request.post(`${SUPABASE_URL}/rest/v1/focusos_tasks`, {
+      headers: restHeaders(s, { Prefer: 'return=minimal' }),
+      data: rows,
+    });
+    expect(res.ok(), `bulk seed at ${from} must succeed (${res.status()})`).toBeTruthy();
+  }
+};
+
+/**
+ * Delete every row this run created, PROVE the deletes landed, sweep the demo
+ * user's folder in the image bucket (empty at baseline, so anything there belongs
+ * to this run), and assert the account is back to its pristine shape. Never throws:
+ * it returns a list of problems, so a cleanup failure can be reported without
+ * swallowing a real test failure.
  */
 const cleanup = async (
   request: APIRequestContext,
   s: Session,
-  stamp: number,
-  storagePath: string,
 ): Promise<string[]> => {
   const problems: string[] = [];
   try {
-    const like = encodeURIComponent(String(stamp));
-    const tasks = await restSelect(request, s, `focusos_tasks?select=id,title&title=like.*${like}*`);
-    for (const t of tasks) {
-      const res = await request.delete(`${SUPABASE_URL}/rest/v1/focusos_tasks?id=eq.${t.id}`, {
-        headers: restHeaders(s, { Prefer: 'return=representation' }),
-      });
-      if (!res.ok()) { problems.push(`focusos_tasks ${t.id}: HTTP ${res.status()}`); continue; }
-      const deleted = await res.json();
-      if (deleted.length !== 1) problems.push(`focusos_tasks ${t.id}: delete removed ${deleted.length} rows`);
-    }
-    const left = await restSelect(request, s, `focusos_tasks?select=id,title&title=like.*${like}*`);
-    if (left.length) problems.push(`tasks left behind: ${left.map((t) => String(t.title)).join(', ')}`);
+    // ONE bulk delete: the large-account case seeds over a thousand rows, far too
+    // many to delete individually. The follow-up select is the proof it landed.
+    const del = await request.delete(
+      `${SUPABASE_URL}/rest/v1/focusos_tasks?user_id=eq.${s.userId}&title=like.zz-*`,
+      { headers: restHeaders(s, { Prefer: 'return=minimal' }) },
+    );
+    if (!del.ok()) problems.push(`zz task delete: HTTP ${del.status()}`);
+    const left = await restSelect(request, s, 'focusos_tasks?select=id,title&title=like.zz-*');
+    if (left.length) problems.push(`zz tasks left behind: ${left.length}`);
 
-    // Nothing is uploaded by this spec (the seed is a path string), so this is a
-    // guard rather than a real delete: a 404/400 means there was no object.
-    const obj = await request.delete(`${SUPABASE_URL}/storage/v1/object/${IMAGE_BUCKET}/${storagePath}`, {
-      headers: { apikey: ANON_KEY, Authorization: `Bearer ${s.token}` },
-    });
-    if (obj.ok()) {
-      const body = await obj.text();
-      if (body.includes(storagePath)) problems.push(`storage object survived the run: ${storagePath}`);
+    // Attaching a photo through the pane is a REAL upload, so the bucket is swept
+    // too, and the sweep is proved by a fresh listing. Retried: a delete has been
+    // seen to answer 200 "Successfully deleted" while the very next listing still
+    // named the object, so one round is not proof.
+    let objects = await listStorage(request, s);
+    for (let round = 0; round < 3 && objects.length > 0; round++) {
+      for (const name of objects) {
+        const obj = await request.delete(
+          `${SUPABASE_URL}/storage/v1/object/${IMAGE_BUCKET}/${s.userId}/${name}`,
+          { headers: { apikey: ANON_KEY, Authorization: `Bearer ${s.token}` } },
+        );
+        if (!obj.ok() && obj.status() !== 404) problems.push(`storage ${name}: HTTP ${obj.status()}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      objects = await listStorage(request, s);
     }
+    if (objects.length) problems.push(`storage objects survived: ${objects.join(', ')}`);
 
     // Pristine baseline, the same assertion tests/project-order.spec.ts ends on.
     const projects = await restCount(request, s, 'focusos_projects');
-    const tasks2 = await restCount(request, s, 'focusos_tasks');
+    const tasks = await restCount(request, s, 'focusos_tasks');
     if (projects !== BASELINE_PROJECTS) problems.push(`projects: ${projects}, baseline ${BASELINE_PROJECTS}`);
-    if (tasks2 !== BASELINE_TASKS) problems.push(`tasks: ${tasks2}, baseline ${BASELINE_TASKS}`);
+    if (tasks !== BASELINE_TASKS) problems.push(`tasks: ${tasks}, baseline ${BASELINE_TASKS}`);
     const ordered = await restSelect(
       request, s, 'focusos_projects?select=name,sort_order,pinned_at',
     );
@@ -258,34 +335,60 @@ const openEditPane = async (page: Page, card: Locator): Promise<Locator> => {
 const galleryLabel = (pane: Locator): Locator =>
   pane.getByRole('button', { name: /Choose from Gallery/ });
 
+/**
+ * Wait until the image reads have stopped arriving. One response is not the end of
+ * the pass: an empty own-read is retried twice (appDataFetchers EMPTY_RETRY_DELAYS)
+ * before the app accepts "no photos", and it is only after that that a save is
+ * allowed to write the column. A quiet window is the honest signal — there is no
+ * response left to await once the last read has landed.
+ */
+const settleImageReads = async (page: Page, quietMs = 2500) => {
+  let last = Date.now();
+  const onResponse = (r: Response) => {
+    if (r.url().includes(IMAGE_SELECT)) last = Date.now();
+  };
+  page.on('response', onResponse);
+  while (Date.now() - last < quietMs) await page.waitForTimeout(200);
+  page.off('response', onResponse);
+};
+
 // ---- cases ---------------------------------------------------------------------
 
 test.describe('task images survive a refetch (TP1)', () => {
-  /** One seeded open task carrying exactly one image path, plus its cleanup. */
+  /**
+   * One seeded OPEN task carrying `opts.images` image paths (1 by default), the
+   * optional bulk filler behind it, and the cleanup that always runs — the body is
+   * wrapped in try/catch so a failing case still hands the demo account back clean.
+   */
   const withSeededTask = async (
     request: APIRequestContext,
-    body: (ctx: { s: Session; taskId: string; title: string; storagePath: string }) => Promise<void>,
+    body: (ctx: { s: Session; taskId: string; title: string; images: string[] }) => Promise<void>,
+    opts: { images?: number; bulk?: { total: number; withImages: number } } = {},
   ) => {
     const s = await restSignIn(request);
     const stamp = Date.now();
     const title = `zz-persist ${stamp}`;
-    const storagePath = `${s.userId}/zz-persist-${stamp}.png`;
+    const images = Array.from(
+      { length: opts.images ?? 1 },
+      (_, i) => `${s.userId}/zz-persist-${stamp}-${i + 1}.png`,
+    );
     let bodyError: Error | null = null;
     let taskId = '';
     try {
+      if (opts.bulk) await seedBulk(request, s, stamp, opts.bulk.total, opts.bulk.withImages);
       taskId = await restInsert(request, s, {
         user_id: s.userId,
         project_id: null,
         title,
         status: 'todo',
         priority: 'medium',
-        images: [storagePath],
+        images,
       });
-      await body({ s, taskId, title, storagePath });
+      await body({ s, taskId, title, images });
     } catch (e) {
       bodyError = e as Error;
     }
-    const problems = await cleanup(request, s, stamp, storagePath);
+    const problems = await cleanup(request, s);
     if (bodyError) {
       if (problems.length) bodyError.message = `${bodyError.message}\n[cleanup problems] ${problems.join('; ')}`;
       throw bodyError;
@@ -430,5 +533,148 @@ test.describe('task images survive a refetch (TP1)', () => {
         .toBe(0);
       await expect(badgeOf(card), 'the badge must go with the image').toHaveCount(0, { timeout: 15000 });
     });
+  });
+
+  test('(e) a 1,100-task account still hydrates the badge, and Save keeps the photo', async ({ page, request }) => {
+    test.setTimeout(420_000);
+    await withSeededTask(request, async ({ s, taskId, title }) => {
+      await signIn(page);
+      await openApp(page);
+      await expect(cardFor(page, title)).toBeVisible({ timeout: 30000 });
+
+      // Watch the image reads of the RELOAD: openApp navigates afresh, so nothing
+      // is served from the React Query cache and hydration goes to the network.
+      const reads: Array<{ url: string; rows: Promise<number> }> = [];
+      const onResponse = (r: Response) => {
+        if (!r.url().includes(IMAGE_SELECT)) return;
+        reads.push({
+          url: r.url(),
+          rows: r.text().then((b) => (JSON.parse(b) as unknown[]).length).catch(() => -1),
+        });
+      };
+      page.on('response', onResponse);
+      const firstRead = page.waitForResponse((r) => r.url().includes(IMAGE_SELECT), { timeout: 90000 });
+      await openApp(page);
+      await firstRead;
+
+      const card = cardFor(page, title);
+      await expect(card).toBeVisible({ timeout: 30000 });
+      // The badge IS the bug: under a capped, unordered read this row falls outside
+      // the returned window and the badge never comes back after the reload.
+      await expect(badgeOf(card)).toHaveText('1', { timeout: 60000 });
+      page.off('response', onResponse);
+
+      expect(reads.length, 'the reload must issue at least one image read').toBeGreaterThan(0);
+      expect(
+        reads.filter((r) => r.url.includes('limit=1000')).map((r) => r.url),
+        'no image read may carry the 1,000-row cap',
+      ).toEqual([]);
+      const counts = await Promise.all(reads.map((r) => r.rows));
+      expect(
+        counts.reduce((a, b) => a + b, 0),
+        'the image reads must return every row holding photos (200 filler + 1 seeded), and only those',
+      ).toBe(201);
+
+      const pane = await openEditPane(page, card);
+      await expect(galleryLabel(pane)).toContainText('(1/8)');
+      const saved = page.waitForResponse(
+        (r) => r.url().includes('/rest/v1/focusos_tasks') && r.request().method() === 'PATCH',
+        { timeout: 30000 },
+      );
+      await pane.getByRole('button', { name: 'Save Changes' }).click();
+      await saved;
+
+      await expect
+        .poll(async () => (await readImages(request, s, taskId)).length, { timeout: 20000 })
+        .toBe(1);
+    }, { bulk: { total: 1100, withImages: 200 } });
+  });
+
+  test('(f) a save cannot wipe photos this device never loaded', async ({ page, request }) => {
+    test.setTimeout(240_000);
+    await withSeededTask(request, async ({ s, taskId, title, images }) => {
+      // "Photos not loaded", forced: every image read answers empty, which is exactly
+      // what a capped read does to a row that falls outside its window. The stored row
+      // is untouched, so the app is saving against a set it has never seen.
+      await page.route(
+        (url) => url.href.includes(IMAGE_SELECT),
+        (route) => route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'access-control-allow-origin': '*' },
+          body: '[]',
+        }),
+      );
+      // The realtime socket has to go with it: a postgres_changes payload carries the
+      // WHOLE row, `images` included, so a single echo would hand the app the very
+      // photos this case says it has never seen and the premise would be gone.
+      await page.routeWebSocket(/realtime\/v1\/websocket/, () => { /* never connected */ });
+
+      await signIn(page);
+      // Wait for the (empty) image read itself: only once it has landed does the app
+      // believe it knows this task's photos, which is the state the save must survive.
+      const hydrated = page.waitForResponse((r) => r.url().includes(IMAGE_SELECT), { timeout: 60000 });
+      await openApp(page);
+      await hydrated;
+      await settleImageReads(page);
+      const card = cardFor(page, title);
+      await expect(card).toBeVisible({ timeout: 30000 });
+      await expect(badgeOf(card), 'nothing hydrated, so there is no badge').toHaveCount(0);
+
+      const pane = await openEditPane(page, card);
+      await expect(galleryLabel(pane), 'the pane sees no photos at all').toContainText('(0/8)');
+      const saved = page.waitForResponse(
+        (r) => r.url().includes('/rest/v1/focusos_tasks') && r.request().method() === 'PATCH',
+        { timeout: 30000 },
+      );
+      await pane.getByRole('button', { name: 'Save Changes' }).click();
+      await saved;
+
+      expect(
+        await readImages(request, s, taskId),
+        'a save that touched no photos must leave the stored ones alone',
+      ).toEqual(images);
+
+      // Fresh load, still blind (the route outlives the reload, and the realtime echo
+      // of that first save does not). Now ADD a photo: the new path must JOIN the
+      // stored pair, never replace it.
+      const hydrated2 = page.waitForResponse((r) => r.url().includes(IMAGE_SELECT), { timeout: 60000 });
+      await openApp(page);
+      await hydrated2;
+      await settleImageReads(page);
+      const card2 = cardFor(page, title);
+      await expect(card2).toBeVisible({ timeout: 30000 });
+      await expect(badgeOf(card2), 'the reload hydrates nothing either').toHaveCount(0);
+
+      // EditTaskDialog mounts fresh on every open and resolves its own user before it
+      // can upload anything, so wait for that round trip instead of racing it.
+      const authed = page.waitForResponse((r) => r.url().includes('/auth/v1/user'), { timeout: 30000 });
+      const pane2 = await openEditPane(page, card2);
+      await authed;
+      const uploaded = page.waitForResponse(
+        (r) => r.url().includes('/storage/v1/object/') && r.request().method() === 'POST',
+        { timeout: 30000 },
+      );
+      await pane2.locator('#edit-file-input').setInputFiles({
+        name: 'zz-pixel.png',
+        mimeType: 'image/png',
+        buffer: PIXEL_PNG,
+      });
+      await uploaded;
+      await expect(galleryLabel(pane2), 'the upload must land in the pane').toContainText('(1/8)');
+
+      const saved2 = page.waitForResponse(
+        (r) => r.url().includes('/rest/v1/focusos_tasks') && r.request().method() === 'PATCH',
+        { timeout: 30000 },
+      );
+      await pane2.getByRole('button', { name: 'Save Changes' }).click();
+      await saved2;
+
+      await expect
+        .poll(async () => (await readImages(request, s, taskId)).length, { timeout: 20000 })
+        .toBe(3);
+      const after = await readImages(request, s, taskId);
+      expect(after.slice(0, 2), 'the stored photos keep their place, first').toEqual(images);
+    }, { images: 2 });
   });
 });

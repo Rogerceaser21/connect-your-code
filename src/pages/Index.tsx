@@ -1726,11 +1726,39 @@ https://www.skyscanner.com`,
       updatedTask = { ...updatedTask, sortOrder: nextSortOrder };
     }
 
+    // TP5: the `images` column is written ONLY when the edit pane actually changed
+    // photos, and then always merged against the STORED row, never against screen
+    // state. Screen state is not evidence: the hydration read can legitimately be
+    // incomplete on a big account, so an empty array on screen means "not loaded
+    // here", never "the user removed them". Unchanged photos leave the column out of
+    // the payload altogether, so a save can no longer wipe what it never saw.
+    const originalImages = originalTask?.images ?? [];
+    const paneImages = updatedTask.images ?? [];
+    const imagesChanged = originalImages.length !== paneImages.length
+      || originalImages.some((p, i) => p !== paneImages[i]);
+    let imagesPatch: { images: string[] } | null = null;
+    if (imagesChanged) {
+      const { data: storedRow, error: storedError } = await supabase
+        .from('focusos_tasks')
+        .select('images')
+        .eq('id', updatedTask.id)
+        .maybeSingle();
+      if (storedError) {
+        // Save the rest of the edit rather than risk writing the wrong photo set.
+        toast.error('Photos not saved, try again');
+      } else {
+        const stored: string[] = Array.isArray(storedRow?.images) ? storedRow.images : [];
+        const removed = new Set(originalImages.filter(p => !paneImages.includes(p)));
+        const added = paneImages.filter(p => !originalImages.includes(p));
+        const final = stored.filter(p => !removed.has(p));
+        for (const p of added) if (!final.includes(p)) final.push(p);
+        imagesPatch = { images: final };
+      }
+    }
+
     // Optimistic update: Update local state immediately to prevent list jumping
     setAllTasks(prevTasks => prevTasks.map(task => task.id === updatedTask.id
-      ? ((updatedTask.images && updatedTask.images.length > 0) || imagesReadyRef.current
-          ? updatedTask
-          : { ...updatedTask, images: task.images })
+      ? { ...updatedTask, images: imagesPatch ? imagesPatch.images : task.images }
       : task));
 
     // Update database in background
@@ -1744,10 +1772,9 @@ https://www.skyscanner.com`,
       start_date: updatedTask.startDate?.toISOString(),
       end_date: updatedTask.endDate?.toISOString(),
       due_date: updatedTask.dueDate?.toISOString(),
-      // Pre-hydration an empty array means "images not loaded yet", not "removed" —
-      // omit the column so a save in that window can't wipe stored images.
-      ...((updatedTask.images && updatedTask.images.length > 0) || imagesReadyRef.current
-        ? { images: updatedTask.images || [] } : {}),
+      // TP5: present only when the pane changed photos (merged against the stored row
+      // above); otherwise the column is left untouched.
+      ...(imagesPatch ?? {}),
       timer_total_seconds: updatedTask.timer.totalSeconds,
       timer_is_running: updatedTask.timer.isRunning,
       timer_start_time: updatedTask.timer.startTime,
@@ -1761,12 +1788,13 @@ https://www.skyscanner.com`,
       return;
     }
 
-    // TP1: the `images` column was written above (attach or remove), so record the new
-    // set here too — the hydrated map is what a later merge or image-less realtime row
-    // falls back to, and a stale entry would resurrect images the user just removed.
-    if ((updatedTask.images && updatedTask.images.length > 0) || imagesReadyRef.current) {
+    // TP1: when the `images` column was written above (attach or remove), record the
+    // new set here too — the hydrated map is what a later merge or image-less realtime
+    // row falls back to, and a stale entry would resurrect images the user just
+    // removed. Nothing written means nothing to record.
+    if (imagesPatch) {
       if (!hydratedImagesRef.current) hydratedImagesRef.current = new Map();
-      hydratedImagesRef.current.set(updatedTask.id, updatedTask.images || []);
+      hydratedImagesRef.current.set(updatedTask.id, imagesPatch.images);
     }
 
     // Bidirectional completion sync for shared tasks

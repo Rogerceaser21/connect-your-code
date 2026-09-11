@@ -251,39 +251,79 @@ async function loadCompletedTasks(client: QueryClient, userId: string): Promise<
   return mergeByIdDesc([...own, ...shared]);
 }
 
-// Deferred image hydration source — the heavy `images` (inline base64) column for every
-// own + shared task, keyed on its own cache entry so an /app remount within staleTime
-// re-applies from cache instead of re-pulling ~21 MB. Returns a map id -> images (only
-// rows that actually hold images), covering BOTH open and completed tasks so a later
-// completed merge can pick images out of it. Own error after retries throws (React Query
-// keeps it retryable); a shared-only error degrades to whatever own returned.
+// Deferred image hydration source — the heavy `images` column for every own + shared
+// task that actually HOLDS photos, keyed on its own cache entry so an /app remount
+// within staleTime re-applies from cache instead of re-pulling. Returns a map
+// id -> images, covering BOTH open and completed tasks so a later completed merge can
+// pick images out of it. Own error after retries throws (React Query keeps it
+// retryable); a shared-only error degrades to whatever own returned.
+//
+// TP5: no row cap here at all. Igor's account holds 1,243 tasks, and an unordered
+// capped select returned an arbitrary 1,000 of them, so a row carrying photos could
+// fall outside the window: after a reload the badge was gone and the next Save wrote
+// [] over the stored photos. The read now asks only for rows that hold photos
+// (`images` not null and not the empty array), orders by `updated_at` desc so the
+// freshest rows arrive first, and pages with `.range()` until a short page ends it.
+// Each page goes through runWithErrorRetry, NOT fetchOwnRows: an account with no
+// photos legitimately returns 0 rows and must not pay the empty-success retries.
+const TASK_IMAGES_PAGE = 500;
+
+// One id + images row as the image read projects it.
+type TaskImageRow = { id: string; images: unknown };
+
+// One half of the image read, paged. `own` returns null on a persistent error so the
+// caller can throw and keep the React Query entry retryable; `shared` is best effort
+// and degrades to whatever was collected before the failure.
+async function fetchImagePages(
+  build: (from: number) => Promise<{ data: TaskImageRow[] | null; error: unknown }>,
+  mode: 'own' | 'shared',
+): Promise<TaskImageRow[] | null> {
+  const rows: TaskImageRow[] = [];
+  for (let from = 0; ; from += TASK_IMAGES_PAGE) {
+    const res = await runWithErrorRetry<TaskImageRow[]>(() => build(from));
+    if (res.error) return mode === 'own' ? null : rows;
+    const page = res.data || [];
+    rows.push(...page);
+    if (page.length < TASK_IMAGES_PAGE) return rows;
+  }
+}
+
 async function loadTaskImages(
   client: QueryClient,
   userId: string,
 ): Promise<Map<string, string[]>> {
   await ensureSession();
   const memberIds = await fetchMemberProjectIds(client, userId);
+  // `images` is jsonb, so "has photos" is not-null AND not the empty array.
+  const withImages = () =>
+    (supabase as any)
+      .from('focusos_tasks')
+      .select('id, images')
+      .not('images', 'is', null)
+      .neq('images', '[]');
   const [own, shared] = await Promise.all([
-    fetchOwnRows(() =>
-      (supabase as any)
-        .from('focusos_tasks')
-        .select('id, images')
-        .eq('user_id', userId)
-        .limit(1000),
+    fetchImagePages(
+      (from) =>
+        withImages()
+          .eq('user_id', userId)
+          .order('updated_at', { ascending: false })
+          .range(from, from + TASK_IMAGES_PAGE - 1),
+      'own',
     ),
     memberIds.length
-      ? fetchSharedRows(() =>
-          (supabase as any)
-            .from('focusos_tasks')
-            .select('id, images')
-            .in('project_id', memberIds)
-            .limit(1000),
+      ? fetchImagePages(
+          (from) =>
+            withImages()
+              .in('project_id', memberIds)
+              .order('updated_at', { ascending: false })
+              .range(from, from + TASK_IMAGES_PAGE - 1),
+          'shared',
         )
-      : Promise.resolve([] as any[]),
+      : Promise.resolve([] as TaskImageRow[]),
   ]);
   if (own === null) throw new Error('[appDataFetchers] task images failed after retries');
   const byId = new Map<string, string[]>();
-  for (const row of [...own, ...shared]) {
+  for (const row of [...own, ...(shared ?? [])]) {
     if (row && Array.isArray(row.images) && row.images.length > 0) {
       byId.set(row.id, row.images as string[]);
     }
