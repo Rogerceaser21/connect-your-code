@@ -464,7 +464,20 @@ const Index = () => {
   // apply therefore PRESERVES any completed tasks already merged in — replacing the whole
   // list would blank the Done tab on every resync/refetch.
   const applyTaskRows = useCallback((rows: any[]) => {
-    const openTasks = rows.map(transformDbTask);
+    // TP1: the task-list projection (TASK_LIST_COLUMNS) omits `images`, so a slim row
+    // must never be read as "images removed" — that display bug becomes data loss on
+    // the next save. Decide on the RAW row, before transformDbTask turns a missing key
+    // into []: key ABSENT keeps whatever images state (or this session's hydrated map)
+    // already holds for that id; key PRESENT wins as-is, [] included, because a full
+    // row carrying an empty array really has lost its images.
+    const existingImagesById = new Map(allTasksRef.current.map(t => [t.id, t.images] as const));
+    const openTasks = rows.map((raw) => {
+      const task = transformDbTask(raw);
+      if (raw && Object.prototype.hasOwnProperty.call(raw, 'images')) return task;
+      const inState = existingImagesById.get(task.id);
+      const kept = (inState && inState.length > 0) ? inState : hydratedImagesRef.current?.get(task.id);
+      return kept && kept.length > 0 ? { ...task, images: kept } : task;
+    });
     // A transient auth/RLS race can return 0 open rows; don't blank a list that already
     // holds open tasks. (0 open is legitimate for an all-completed account, whose state
     // holds only completed rows — that case is allowed through.)
@@ -866,10 +879,11 @@ const Index = () => {
 
     // Preserve locally-hydrated images when a realtime row carries none: the slim task-list
     // load omits `images`, so a realtime payload for a row hydrated this session can arrive
-    // image-less. Take the incoming as-is once the image pass has run (imagesReadyRef) or
-    // the payload actually carries images; otherwise keep the existing/hydrated images.
-    const preserveImages = (incoming: Task, existing: Task | undefined): Task => {
-      if ((incoming.images && incoming.images.length > 0) || imagesReadyRef.current) return incoming;
+    // image-less. TP1: the decision is the raw row's `images` KEY, not imagesReadyRef —
+    // key present means the payload speaks for the column (an empty array really is
+    // "removed"), key absent means it says nothing and the existing/hydrated set stands.
+    const preserveImages = (incoming: Task, existing: Task | undefined, rawHasImages: boolean): Task => {
+      if (rawHasImages) return incoming;
       const preserved = (existing?.images && existing.images.length > 0)
         ? existing.images
         : hydratedImagesRef.current?.get(incoming.id);
@@ -909,14 +923,15 @@ const Index = () => {
     // refetch. Never seed an empty list mid-cold-load — the initial load will populate it.
     const upsertTask = (raw: any) => {
       const incoming = transformDbTask(raw);
+      const rawHasImages = !!raw && Object.prototype.hasOwnProperty.call(raw, 'images');
       setAllTasks(prev => {
         const idx = prev.findIndex(t => t.id === incoming.id);
         if (idx === -1) {
           if (prev.length === 0) return prev;
-          return [...prev, preserveImages(incoming, undefined)];
+          return [...prev, preserveImages(incoming, undefined, rawHasImages)];
         }
         const next = prev.slice();
-        next[idx] = preserveImages(incoming, prev[idx]);
+        next[idx] = preserveImages(incoming, prev[idx], rawHasImages);
         return next;
       });
       patchCaches(raw, false);
@@ -1664,6 +1679,10 @@ https://www.skyscanner.com`,
     // The realtime INSERT handler dedupes by id, so no duplicate row will appear.
     if (data) {
       const inserted = transformDbTask(data);
+      // TP1: keep this session's hydrated map in step with what was just written, so a
+      // later completed merge or an image-less realtime row preserves the right set.
+      if (!hydratedImagesRef.current) hydratedImagesRef.current = new Map();
+      hydratedImagesRef.current.set(inserted.id, inserted.images || []);
       setAllTasks(prev => prev.length === 0 || prev.some(t => t.id === inserted.id) ? prev : [...prev, inserted]);
     }
     // Toast is fired by AddTaskDialog; do not duplicate it here.
@@ -1740,6 +1759,14 @@ https://www.skyscanner.com`,
       toast.error('Failed to update task');
       fetchTasks();
       return;
+    }
+
+    // TP1: the `images` column was written above (attach or remove), so record the new
+    // set here too — the hydrated map is what a later merge or image-less realtime row
+    // falls back to, and a stale entry would resurrect images the user just removed.
+    if ((updatedTask.images && updatedTask.images.length > 0) || imagesReadyRef.current) {
+      if (!hydratedImagesRef.current) hydratedImagesRef.current = new Map();
+      hydratedImagesRef.current.set(updatedTask.id, updatedTask.images || []);
     }
 
     // Bidirectional completion sync for shared tasks
