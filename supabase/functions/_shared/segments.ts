@@ -86,6 +86,37 @@ export function findInitBoundary(bytes: Uint8Array): number {
   throw new Error("WebM init boundary not found: no Cluster element (1F 43 B6 75)");
 }
 
+/**
+ * Offset of the LAST WebM Cluster element (1F 43 B6 75) inside a chunk.
+ *
+ * A chunk boundary cuts a Cluster in half (Chromium clusters are ~1 s, Safari
+ * ~10 s), so the segment that STARTS at that boundary opens mid-SimpleBlock:
+ * the demuxer reads a garbage length, logs "Truncating packet", invents a
+ * phantom stream and drops that cluster's audio. Prepending
+ * `chunk[first - 1].slice(findLeadBoundary(...))` — the head of exactly that
+ * cut Cluster — makes the cluster whole again.
+ *
+ * Throws when no Cluster is present (nothing to lead with), and when the last
+ * Cluster starts at byte 0 (the whole chunk would become the lead, i.e. up to
+ * 30 s of duplicated audio). Callers treat both as "compose without a lead".
+ */
+export function findLeadBoundary(bytes: Uint8Array): number {
+  for (let i = bytes.length - CLUSTER_ID.length; i >= 0; i--) {
+    if (
+      bytes[i] === CLUSTER_ID[0] &&
+      bytes[i + 1] === CLUSTER_ID[1] &&
+      bytes[i + 2] === CLUSTER_ID[2] &&
+      bytes[i + 3] === CLUSTER_ID[3]
+    ) {
+      if (i === 0) {
+        throw new Error("WebM lead boundary at offset 0: the whole chunk is one cluster");
+      }
+      return i;
+    }
+  }
+  throw new Error("WebM lead boundary not found: no Cluster element (1F 43 B6 75)");
+}
+
 /** Wall-clock second at which segment `index` starts inside the meeting. */
 export function segmentStartSeconds(
   index: number,
@@ -137,6 +168,19 @@ export function firstMissingSegment(
   return null;
 }
 
+/** How many segments still have no text (what a worker reports as `remaining`). */
+export function countMissingSegments(
+  texts: Record<string, string> | null | undefined,
+  total: number,
+): number {
+  let missing = 0;
+  for (let i = 0; i < total; i++) {
+    const text = texts?.[String(i)];
+    if (!text || !text.trim()) missing++;
+  }
+  return missing;
+}
+
 /** True only while a lease exists and its `until` is still in the future. */
 export function leaseIsValid(
   lease: SegmentLease | null | undefined,
@@ -153,4 +197,49 @@ export function leaseIsValid(
 /** GCS object name of chunk `i` inside a recording folder. */
 export function chunkObjectName(folder: string, i: number): string {
   return `${folder}/chunks/${String(i).padStart(5, "0")}.webm`;
+}
+
+/** GCS object holding the EBML header shared by every segment after the first. */
+export function initObjectName(folder: string): string {
+  return `${folder}/init.webm`;
+}
+
+/** Prefix every composed segment and lead object lives under. */
+export function segmentsPrefix(folder: string): string {
+  return `${folder}/segments/`;
+}
+
+/** GCS object name of the composed segment `i`. */
+export function segmentObjectName(folder: string, i: number): string {
+  return `${segmentsPrefix(folder)}${String(i).padStart(2, "0")}.webm`;
+}
+
+/** GCS object name of segment `i`'s lead cluster (see findLeadBoundary). */
+export function leadObjectName(folder: string, i: number): string {
+  return `${segmentsPrefix(folder)}${String(i).padStart(2, "0")}-lead.webm`;
+}
+
+/**
+ * The transcription prompt for ONE segment.
+ *
+ * The base wording is the app's original whole-file production prompt, kept
+ * verbatim: a terser rewrite made Gemini answer looped speech with a single
+ * sentence (evidence handoff/evidence/mt0/gemini-seg0-*.txt). Only the
+ * part/offset sentence and the overlap sentence are added.
+ */
+export function buildSegmentPrompt(
+  index: number,
+  total: number,
+  startHms: string,
+  participantNames: string[],
+  previousTail: string,
+): string {
+  const participantsLine = participantNames.length > 0
+    ? ` The participants are: ${participantNames.join(", ")}. Label each speaker by their name where possible.`
+    : " Include speaker diarization where possible (label speakers as Speaker 1, Speaker 2, etc.).";
+  const tail = (previousTail ?? "").trim();
+  const overlapLine = index > 0 && tail
+    ? ` The first few seconds of this part overlap with the end of the previous part, which ended with: "${tail}". Do not repeat those words; continue from where the previous part ended and keep the same speaker labels.`
+    : "";
+  return `Transcribe this audio recording of a meeting. This is part ${index + 1} of ${total} of the recording; it starts at ${startHms} of the meeting.${participantsLine} Format the output as a clean transcript with speaker labels. Do not include timestamps. Transcribe every sentence that is spoken, even if a passage is repeated. Be thorough and accurate.${overlapLine}`;
 }

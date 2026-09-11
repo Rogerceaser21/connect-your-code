@@ -93,20 +93,16 @@ export async function uploadToGcs(
 }
 
 /**
- * How many `${folder}/chunks/NNNNN.webm` objects exist. Pages through the
- * list API (default page size is 1000, and a long meeting can exceed it).
+ * Every object name under `prefix`, paging the list API (its default page size
+ * is 1000 and a long meeting can exceed it).
  */
-export async function listChunkCount(
+export async function listObjectNames(
   token: string,
   bucket: string,
-  folder: string
-): Promise<number> {
-  const prefix = `${folder}/chunks/`;
-  const pattern = new RegExp(
-    `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d{5}\\.webm$`
-  );
+  prefix: string
+): Promise<string[]> {
+  const names: string[] = [];
   let pageToken: string | undefined;
-  let count = 0;
 
   do {
     const params = new URLSearchParams({
@@ -125,12 +121,28 @@ export async function listChunkCount(
     }
     const page = await resp.json();
     for (const item of page.items || []) {
-      if (pattern.test(item?.name || "")) count++;
+      if (item?.name) names.push(item.name as string);
     }
     pageToken = page.nextPageToken || undefined;
   } while (pageToken);
 
-  return count;
+  return names;
+}
+
+/**
+ * How many `${folder}/chunks/NNNNN.webm` objects exist.
+ */
+export async function listChunkCount(
+  token: string,
+  bucket: string,
+  folder: string
+): Promise<number> {
+  const prefix = `${folder}/chunks/`;
+  const pattern = new RegExp(
+    `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d{5}\\.webm$`
+  );
+  const names = await listObjectNames(token, bucket, prefix);
+  return names.filter((name) => pattern.test(name)).length;
 }
 
 /**
@@ -185,4 +197,20 @@ export async function downloadObject(
     throw new Error(`GCS download failed for ${name}: ${err}`);
   }
   return new Uint8Array(await resp.arrayBuffer());
+}
+
+/** Delete one object. A 404 counts as success (the object is already gone). */
+export async function deleteObject(
+  token: string,
+  bucket: string,
+  name: string
+): Promise<void> {
+  const resp = await fetch(
+    `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(name)}`,
+    { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!resp.ok && resp.status !== 404) {
+    throw new Error(`GCS delete failed for ${name}: ${await resp.text()}`);
+  }
+  await resp.body?.cancel();
 }

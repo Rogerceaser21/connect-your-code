@@ -1,13 +1,20 @@
 import { assertEquals, assertThrows } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import {
+  buildSegmentPrompt,
   chunkObjectName,
+  countMissingSegments,
   findInitBoundary,
+  findLeadBoundary,
   firstMissingSegment,
   formatHMS,
+  initObjectName,
   joinTranscript,
+  leadObjectName,
   leaseIsValid,
   planSegments,
+  segmentObjectName,
   segmentStartSeconds,
+  segmentsPrefix,
 } from "./segments.ts";
 
 Deno.test("planSegments: 157 chunks -> 8 segments, last is 140..156", () => {
@@ -53,6 +60,34 @@ Deno.test("findInitBoundary: throws when absent", () => {
 Deno.test("findInitBoundary: throws when the cluster is at offset 0", () => {
   const bytes = new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 0x00, 0x11]);
   assertThrows(() => findInitBoundary(bytes), Error, "offset 0");
+});
+
+Deno.test("findLeadBoundary: takes the LAST cluster when several exist", () => {
+  const bytes = new Uint8Array([
+    0xa3, 0x01, 0x02, 0x03,           // 0: tail of the cluster cut by the boundary
+    0x1f, 0x43, 0xb6, 0x75,           // 4: first cluster in this chunk
+    0x00, 0x11, 0x22,
+    0x1f, 0x43, 0xb6, 0x75,           // 11: LAST cluster — the one the next chunk cuts
+    0xaa, 0xbb,
+  ]);
+  assertEquals(findLeadBoundary(bytes), 11);
+  assertEquals(findInitBoundary(bytes), 4); // same buffer, opposite end
+  assertEquals(bytes.slice(findLeadBoundary(bytes)).length, 6);
+});
+
+Deno.test("findLeadBoundary: finds a cluster id that ends the buffer", () => {
+  const bytes = new Uint8Array([0x00, 0x11, 0x1f, 0x43, 0xb6, 0x75]);
+  assertEquals(findLeadBoundary(bytes), 2);
+});
+
+Deno.test("findLeadBoundary: throws when absent", () => {
+  const bytes = new Uint8Array([0xa3, 0x00, 0x11, 0x1f, 0x43, 0xb6, 0x00]);
+  assertThrows(() => findLeadBoundary(bytes), Error, "not found");
+});
+
+Deno.test("findLeadBoundary: throws when the last cluster is at offset 0", () => {
+  const bytes = new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 0x00, 0x11]);
+  assertThrows(() => findLeadBoundary(bytes), Error, "offset 0");
 });
 
 Deno.test("segmentStartSeconds + formatHMS", () => {
@@ -105,4 +140,56 @@ Deno.test("leaseIsValid: null, past and future", () => {
 Deno.test("chunkObjectName: 5-digit zero padding", () => {
   assertEquals(chunkObjectName("user/ts", 0), "user/ts/chunks/00000.webm");
   assertEquals(chunkObjectName("user/ts", 156), "user/ts/chunks/00156.webm");
+});
+
+Deno.test("countMissingSegments: counts holes, not just the first", () => {
+  assertEquals(countMissingSegments({ "0": "a", "2": "c" }, 4), 2);
+  assertEquals(countMissingSegments({ "0": "a", "1": "b" }, 2), 0);
+  assertEquals(countMissingSegments(null, 3), 3);
+  assertEquals(countMissingSegments({ "0": "a", "1": "  " }, 2), 1);
+});
+
+Deno.test("object names: init, segments prefix, segment and lead", () => {
+  assertEquals(initObjectName("user/ts"), "user/ts/init.webm");
+  assertEquals(segmentsPrefix("user/ts"), "user/ts/segments/");
+  assertEquals(segmentObjectName("user/ts", 0), "user/ts/segments/00.webm");
+  assertEquals(segmentObjectName("user/ts", 7), "user/ts/segments/07.webm");
+  assertEquals(leadObjectName("user/ts", 7), "user/ts/segments/07-lead.webm");
+  assertEquals(leadObjectName("user/ts", 12), "user/ts/segments/12-lead.webm");
+});
+
+Deno.test("buildSegmentPrompt: part 1 keeps the production wording, no overlap line", () => {
+  const prompt = buildSegmentPrompt(0, 3, "00:00:00", [], "ignored tail");
+  assertEquals(
+    prompt,
+    "Transcribe this audio recording of a meeting. This is part 1 of 3 of the recording; " +
+      "it starts at 00:00:00 of the meeting. Include speaker diarization where possible " +
+      "(label speakers as Speaker 1, Speaker 2, etc.). Format the output as a clean transcript " +
+      "with speaker labels. Do not include timestamps. Transcribe every sentence that is spoken, " +
+      "even if a passage is repeated. Be thorough and accurate.",
+  );
+});
+
+Deno.test("buildSegmentPrompt: later parts name the participants and the overlap", () => {
+  const prompt = buildSegmentPrompt(1, 3, "00:10:00", ["Igor", "Maria"], "…before lunch.");
+  assertEquals(prompt.includes("This is part 2 of 3 of the recording; it starts at 00:10:00"), true);
+  assertEquals(
+    prompt.includes("The participants are: Igor, Maria. Label each speaker by their name where possible."),
+    true,
+  );
+  assertEquals(prompt.includes("Transcribe every sentence that is spoken, even if a passage is repeated."), true);
+  assertEquals(
+    prompt.endsWith(
+      'The first few seconds of this part overlap with the end of the previous part, which ended ' +
+        'with: "…before lunch.". Do not repeat those words; continue from where the previous part ' +
+        'ended and keep the same speaker labels.',
+    ),
+    true,
+  );
+});
+
+Deno.test("buildSegmentPrompt: a later part with no previous text drops the overlap line", () => {
+  const prompt = buildSegmentPrompt(2, 3, "00:20:00", [], "   ");
+  assertEquals(prompt.endsWith("Be thorough and accurate."), true);
+  assertEquals(prompt.includes("overlap"), false);
 });
