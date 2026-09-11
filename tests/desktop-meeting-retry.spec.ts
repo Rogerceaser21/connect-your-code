@@ -30,14 +30,20 @@
 // reason the progress cases are served from intercepts.
 //
 // Cases:
-//   (b) a Failed card retries: the invoke body deep-equals { meetingId, retry: true }
-//       and the row really is reset to transcribing / null error / 0 attempts;
+//   (b) a Failed card retries: the invoke body deep-equals { meetingId, retry: true },
+//       the row really is reset to transcribing / null error / 0 attempts, and once the
+//       served poll says 'done' the banner leaves and the page lands on /meetings/<id>;
 //   (c) the banner counts: "Transcribing 3/8", then "Transcribing..." once the
 //       served ledger goes back to null;
 //   (c2) the list-card pill counts the same way, straight off the row applyMeetings
 //       mapped, with no poll involved;
-//   (d) a reset that fails (403) toasts "Could not reset the meeting for retry"
-//       and sends NO transcribe-meeting request at all.
+//   (d) a reset that fails (403) toasts "Could not reset the meeting for retry",
+//       sends NO transcribe-meeting request at all, and never raises the banner;
+//   (f) old-backend tolerance: the poll's wide select is answered 400 / 42703 (the
+//       pre-migration table, which has no transcript_segments column), and the client
+//       re-asks the two-column question, keeps polling THAT, and still reaches 'done';
+//   (g) a reset whose PATCH comes back with no row (204 empty, and again as a 200 [])
+//       is refused exactly like the 403: toast, no invoke, no banner, row untouched.
 // Every case ends in (e): the seeded row is deleted, 0 zz meetings are left, and
 // the demo account is back to its 3 projects / 7 tasks baseline with every
 // sort_order and pinned_at null.
@@ -45,7 +51,9 @@
 // Cases run one at a time (playwright.config.ts: workers 1, fullyParallel off) —
 // the demo account is shared, so two runs at once would stomp each other.
 //
-// Run: PW_PORT=8094 npx playwright test tests/desktop-meeting-retry.spec.ts --project=desktop-mouse
+// Run: PW_PORT=<a free port, the harness spins its own Vite there> npx playwright test \
+//        tests/desktop-meeting-retry.spec.ts --project=desktop-mouse
+// (never 8080 — that is Igor's detached preview server.)
 import { test, expect, type Page, type APIRequestContext, type Locator, type Route } from '@playwright/test';
 
 const BASE = process.env.WAVE_BASE_URL ?? '';
@@ -193,9 +201,30 @@ const cleanup = async (request: APIRequestContext, s: Session): Promise<string[]
 const TRANSCRIBE_FN = '/functions/v1/focusos-transcribe-meeting';
 const POLLER_FN = '/functions/v1/focusos-poll-stuck-meetings';
 
-/** The single-row status poll: `select('processing_status, ...')` on the wire. */
+/**
+ * The single-row status poll: `select('processing_status, ...')` on the wire. URL only,
+ * so it is deliberately METHOD-BLIND — since the fix round the retry's reset PATCH
+ * carries `select=processing_status,gemini_transcribe_attempts` as well, and a route
+ * that fulfilled that with a poll payload would break Retry itself. Every status-poll
+ * route below therefore goes through routeStatusPoll, which serves GETs and passes
+ * everything else straight through.
+ */
 const isStatusPoll = (url: string) =>
   url.includes('/rest/v1/focusos_meetings') && url.includes('select=processing_status');
+
+/** Serve the status-poll GET; every other focusos_meetings request continues untouched. */
+const routeStatusPoll = async (
+  page: Page,
+  handler: (route: Route) => Promise<void> | void,
+): Promise<void> => {
+  await page.route(
+    (url) => isStatusPoll(url.href),
+    async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      return handler(route);
+    },
+  );
+};
 
 /** The full list read applyMeetings maps: `select('*').order('created_at', ...)`. */
 const isMeetingList = (url: string) =>
@@ -305,6 +334,16 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
     test.setTimeout(120_000);
     await withSeededMeeting(request, async ({ s, meetingId, title }) => {
       const captured = await stubFunctions(page);
+
+      // The poll is scripted from here: 'transcribing' while the retry is being proven,
+      // then 'done' to watch the banner leave. Two-column payload on purpose — that is
+      // the shape the pre-migration table can actually answer (see (f)).
+      let pollStatus = 'transcribing';
+      await routeStatusPoll(page, (route) => fulfilJson(route, {
+        processing_status: pollStatus,
+        processing_error: null,
+      }));
+
       await signIn(page);
       const card = await openMeetings(page, title);
 
@@ -334,6 +373,12 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
         processing_error: null,
         gemini_transcribe_attempts: 0,
       });
+
+      // ...and the banner does not spin for ever: the first poll that reads 'done'
+      // navigates to the meeting and takes the label with it.
+      pollStatus = 'done';
+      await page.waitForURL(`**/meetings/${meetingId}`, { timeout: 30000 });
+      await expect(bannerLabel(page)).toHaveCount(0, { timeout: 10000 });
     });
   });
 
@@ -345,14 +390,11 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
       // The ledger this run serves to the status poll. Swapped mid-test, so the
       // banner has to follow the data rather than latch on first read.
       let segments: unknown = { total: 8, texts: { '0': 'a', '1': 'b', '2': 'c' } };
-      await page.route(
-        (url) => isStatusPoll(url.href),
-        (route) => fulfilJson(route, {
-          processing_status: 'transcribing',
-          processing_error: null,
-          transcript_segments: segments,
-        }),
-      );
+      await routeStatusPoll(page, (route) => fulfilJson(route, {
+        processing_status: 'transcribing',
+        processing_error: null,
+        transcript_segments: segments,
+      }));
 
       await signIn(page);
       const card = await openMeetings(page, title);
@@ -435,7 +477,158 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
         await page.waitForTimeout(250);
       }
 
+      // The page never flipped into its processing state either: no banner, so no
+      // spinner left behind for a run that was refused. Positive wait, then absence.
+      await page.waitForTimeout(2000);
+      await expect(bannerLabel(page)).toHaveCount(0);
+
       // The row is untouched, error and exhausted counter and all.
+      expect(await readMeeting(request, s, meetingId)).toEqual({
+        processing_status: 'error',
+        processing_error: SEED_ERROR,
+        gemini_transcribe_attempts: SEED_ATTEMPTS,
+      });
+    });
+  });
+
+  test('(f) a pre-migration backend (no transcript_segments column) still polls through to done', async ({ page, request }) => {
+    test.setTimeout(120_000);
+    await withSeededMeeting(request, async ({ meetingId, title }) => {
+      const captured = await stubFunctions(page);
+
+      // transcript_segments does NOT exist on the live table yet (the server half of
+      // this wave adds it), and PostgREST answers an unknown column with HTTP 400 /
+      // code 42703. `if (error || !data) return;` swallowed that, so before the fix
+      // round the poll never reached 'done' or 'error': no navigate, no toast, a
+      // banner that spins for ever, for Retry / fresh recordings / orphan recovery
+      // alike. Here the WIDE select always 400s, so a client that does not downgrade
+      // to the two-column question can never pass this case.
+      let wideHits = 0;
+      let narrowHits = 0;
+      let narrowStatus = 'transcribing';
+      await routeStatusPoll(page, (route) => {
+        if (route.request().url().includes('transcript_segments')) {
+          wideHits += 1;
+          return fulfilJson(route, {
+            code: '42703',
+            message: 'column focusos_meetings.transcript_segments does not exist',
+            details: null,
+            hint: null,
+          }, 400);
+        }
+        narrowHits += 1;
+        return fulfilJson(route, { processing_status: narrowStatus, processing_error: null });
+      });
+
+      await signIn(page);
+      const card = await openMeetings(page, title);
+
+      // The re-issued poll: the same question with transcript_segments dropped. Armed
+      // BEFORE the click, because the downgrade happens inside the very first tick.
+      const fallbackPoll = page.waitForRequest(
+        (req) => isStatusPoll(req.url())
+          && req.method() === 'GET'
+          && !req.url().includes('transcript_segments'),
+        { timeout: 30000 },
+      );
+      await card.locator('[title="Retry processing"]').click();
+      await fallbackPoll;
+
+      // The retry itself is unaffected by the downgrade.
+      await expect.poll(() => captured.bodies.length, {
+        message: 'Retry must still invoke focusos-transcribe-meeting exactly once',
+        timeout: 30000,
+      }).toBe(1);
+      expect(captured.bodies[0]).toEqual({ meetingId, retry: true });
+
+      // progress = null on the fallback read, so the count-less label.
+      await expect(bannerLabel(page)).toHaveText('Transcribing...', { timeout: 15000 });
+
+      // The ref sticks: later ticks (the poll runs every 5s) ask the narrow question
+      // straight away, so the 400 is paid ONCE for the whole mount, not once a tick.
+      await expect.poll(() => narrowHits, {
+        message: 'the poll must keep running on the narrow select',
+        timeout: 30000,
+      }).toBeGreaterThanOrEqual(3);
+      expect(wideHits, 'the wide select must be tried once and never again').toBe(1);
+
+      // ...and the poll still reaches its exit: done -> navigate, banner gone.
+      narrowStatus = 'done';
+      await page.waitForURL(`**/meetings/${meetingId}`, { timeout: 30000 });
+      await expect(bannerLabel(page)).toHaveCount(0, { timeout: 10000 });
+    });
+  });
+
+  test('(g) a reset PATCH that comes back with no row is refused like a failed reset', async ({ page, request }) => {
+    test.setTimeout(120_000);
+    await withSeededMeeting(request, async ({ s, meetingId, title }) => {
+      const captured = await stubFunctions(page);
+
+      // What "no row" actually looks like to supabase-js, read out of
+      // @supabase/postgrest-js 2.110.0 (dist/index.mjs, processResponse): the
+      // empty-array -> null collapse is gated on `isMaybeSingle`, which ONLY
+      // .maybeSingle() sets. So for the .single() this reset uses:
+      //   * 204 / empty body -> { data: null, error: null }  <- the true "no row"
+      //   * 200 / []         -> { data: [],   error: null }  <- an array, still no error
+      // NEITHER carries an error, which is the whole point of the fix: the guard has to
+      // read the returned VALUES (processing_status / gemini_transcribe_attempts), not
+      // just `error`. Both shapes are exercised below, in that order.
+      let patchHits = 0;
+      let emptyBody = true;
+      await page.route(
+        (url) => url.href.includes('/rest/v1/focusos_meetings'),
+        async (route) => {
+          if (route.request().method() !== 'PATCH') return route.continue();
+          patchHits += 1;
+          if (emptyBody) {
+            return route.fulfill({
+              status: 204,
+              headers: { 'access-control-allow-origin': '*' },
+              body: '',
+            });
+          }
+          return fulfilJson(route, []);
+        },
+      );
+
+      /** No invoke may fire across a window — the invoke is fire-and-forget. */
+      const noInvokeFor = async (ms: number) => {
+        const deadline = Date.now() + ms;
+        while (Date.now() < deadline) {
+          expect(captured.bodies, 'no transcribe-meeting invoke after a rowless reset').toEqual([]);
+          await page.waitForTimeout(250);
+        }
+      };
+
+      await signIn(page);
+      const card = await openMeetings(page, title);
+      const retry = card.locator('[title="Retry processing"]');
+      await expect(retry).toBeVisible();
+
+      // Shape 1: 204 with no body.
+      await retry.click();
+      await expect(
+        page.locator('[data-sonner-toast]', { hasText: 'Could not reset the meeting for retry' }),
+      ).toBeVisible({ timeout: 20000 });
+      await expect.poll(() => patchHits, {
+        message: 'the reset PATCH must have been attempted',
+        timeout: 20000,
+      }).toBe(1);
+      await noInvokeFor(4000);
+      await expect(bannerLabel(page)).toHaveCount(0);
+
+      // Shape 2: 200 with an empty array. Same refusal — asserted on the invoke and
+      // the banner rather than the toast, which is already on screen from shape 1.
+      emptyBody = false;
+      await retry.click();
+      await expect.poll(() => patchHits, {
+        message: 'the second reset PATCH must have been attempted',
+        timeout: 20000,
+      }).toBe(2);
+      await noInvokeFor(4000);
+      await expect(bannerLabel(page)).toHaveCount(0);
+
+      // Nothing reached the table on either shape.
       expect(await readMeeting(request, s, meetingId)).toEqual({
         processing_status: 'error',
         processing_error: SEED_ERROR,
