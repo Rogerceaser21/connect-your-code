@@ -3,19 +3,31 @@ import {
   buildSegmentPrompt,
   chunkObjectName,
   countMissingSegments,
+  extractTranscriptText,
   findInitBoundary,
   findLeadBoundary,
   firstMissingSegment,
   formatHMS,
+  hexHead,
   initObjectName,
+  isWebm,
   joinTranscript,
   leadObjectName,
   leaseIsValid,
+  NO_SPEECH_TEXT,
   planSegments,
+  scrubSecrets,
   segmentObjectName,
   segmentStartSeconds,
   segmentsPrefix,
 } from "./segments.ts";
+
+/** A generateContent 200 body with one candidate. */
+function geminiBody(text: string, finishReason: string | null = "STOP") {
+  const candidate: Record<string, unknown> = { content: { parts: [{ text }] } };
+  if (finishReason !== null) candidate.finishReason = finishReason;
+  return { candidates: [candidate] };
+}
 
 Deno.test("planSegments: 157 chunks -> 8 segments, last is 140..156", () => {
   const plans = planSegments(157);
@@ -192,4 +204,87 @@ Deno.test("buildSegmentPrompt: a later part with no previous text drops the over
   const prompt = buildSegmentPrompt(2, 3, "00:20:00", [], "   ");
   assertEquals(prompt.endsWith("Be thorough and accurate."), true);
   assertEquals(prompt.includes("overlap"), false);
+});
+
+Deno.test("extractTranscriptText: normal text comes through untouched", () => {
+  const out = extractTranscriptText(geminiBody("Speaker 1: hello there."));
+  assertEquals(out, { text: "Speaker 1: hello there." });
+  // several parts are concatenated, not just the first
+  assertEquals(
+    extractTranscriptText({
+      candidates: [{ finishReason: "STOP", content: { parts: [{ text: "a" }, { text: "b" }] } }],
+    }),
+    { text: "ab" },
+  );
+});
+
+Deno.test("extractTranscriptText: empty + STOP (or no reason) -> silent sentinel", () => {
+  assertEquals(extractTranscriptText(geminiBody("", "STOP")), { text: NO_SPEECH_TEXT });
+  assertEquals(extractTranscriptText(geminiBody("   \n ", "STOP")), { text: NO_SPEECH_TEXT });
+  assertEquals(extractTranscriptText(geminiBody("", null)), { text: NO_SPEECH_TEXT });
+  // the sentinel must be NON-BLANK, or the segment reads as "not done yet"
+  assertEquals(NO_SPEECH_TEXT.trim().length > 0, true);
+  assertEquals(firstMissingSegment({ "0": NO_SPEECH_TEXT }, 1), null);
+});
+
+Deno.test("extractTranscriptText: a non-STOP finishReason is an error naming it", () => {
+  const empty = extractTranscriptText(geminiBody("", "MAX_TOKENS")) as { error: string };
+  assertEquals(empty.error.includes("MAX_TOKENS"), true);
+  // a truncated segment is not a transcript of the segment, text or not
+  const partial = extractTranscriptText(geminiBody("half a sent", "MAX_TOKENS")) as { error: string };
+  assertEquals(partial.error.includes("MAX_TOKENS"), true);
+  const unsafe = extractTranscriptText(geminiBody("", "SAFETY")) as { error: string };
+  assertEquals(unsafe.error.includes("SAFETY"), true);
+});
+
+Deno.test("extractTranscriptText: no candidates -> error (with any blockReason)", () => {
+  const none = extractTranscriptText({}) as { error: string };
+  assertEquals(none.error.includes("no candidates"), true);
+  const blocked = extractTranscriptText({
+    candidates: [],
+    promptFeedback: { blockReason: "OTHER" },
+  }) as { error: string };
+  assertEquals(blocked.error.includes("no candidates"), true);
+  assertEquals(blocked.error.includes("OTHER"), true);
+});
+
+Deno.test("isWebm: EBML magic passes, an mp4 ftyp box fails", () => {
+  assertEquals(isWebm(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42])), true);
+  // audio/mp4 from a browser without MediaRecorder WebM support
+  const mp4 = new Uint8Array([0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70]);
+  assertEquals(isWebm(mp4), false);
+  assertEquals(hexHead(mp4), "00 00 00 20");
+});
+
+Deno.test("isWebm: short, empty and missing buffers fail", () => {
+  assertEquals(isWebm(new Uint8Array([0x1a, 0x45, 0xdf])), false);
+  assertEquals(isWebm(new Uint8Array([])), false);
+  assertEquals(isWebm(null), false);
+  assertEquals(isWebm(undefined), false);
+  assertEquals(hexHead(new Uint8Array([])), "(empty)");
+});
+
+Deno.test("scrubSecrets: a Gemini URL in a fetch error loses its key", () => {
+  const raw =
+    "error sending request for url (https://generativelanguage.googleapis.com/v1beta/files/abc?key=AIzaSyTOPSECRET123)";
+  const out = scrubSecrets(raw);
+  assertEquals(out.includes("AIzaSyTOPSECRET123"), false);
+  assertEquals(out.includes("key=***"), true);
+  assertEquals(out.endsWith(")"), true); // the URL's closing bracket survives
+  // &-delimited and quoted forms too
+  assertEquals(scrubSecrets("?key=abc123&alt=media").includes("abc123"), false);
+  assertEquals(scrubSecrets("?key=abc123&alt=media").includes("alt=media"), true);
+});
+
+Deno.test("scrubSecrets: known secret VALUES are replaced wherever they appear", () => {
+  const serviceKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.service-role-secret";
+  const geminiKey = "AIzaSyABCDEFGHIJKL";
+  const raw = `Bearer ${serviceKey} failed, then ${geminiKey} was rejected`;
+  const out = scrubSecrets(raw, [serviceKey, geminiKey, undefined, null, "short"]);
+  assertEquals(out.includes(serviceKey), false);
+  assertEquals(out.includes(geminiKey), false);
+  assertEquals(out, "Bearer *** failed, then *** was rejected");
+  // an Error instance and a nullish message are both safe inputs
+  assertEquals(scrubSecrets(new Error("plain")), "plain");
+  assertEquals(scrubSecrets(undefined), "");
 });

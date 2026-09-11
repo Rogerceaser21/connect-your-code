@@ -1,7 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { generateSummary } from "../_shared/gemini.ts";
-import { leaseIsValid, type SegmentsState } from "../_shared/segments.ts";
+import { leaseIsValid, scrubSecrets, type SegmentsState } from "../_shared/segments.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -90,14 +90,25 @@ serve(async (req) => {
 
           if (resumes > MAX_RESUMES) {
             console.log(`[poller] giving up on ${row.id} after ${resumes - 1} resumes`);
+            // KEEP the cause the worker already wrote: "stalled after N resumes"
+            // on its own tells nobody why it stalled.
+            const stalled = `Transcription stalled after ${MAX_RESUMES} resumes`;
+            const cause = scrubSecrets(row.processing_error ?? "", [
+              supabaseServiceKey,
+              GEMINI_API_KEY,
+            ]).trim();
             await supabase
               .from("focusos_meetings")
               .update({
                 processing_status: "error",
-                processing_error: `Transcription stalled after ${MAX_RESUMES} resumes`,
+                processing_error: cause
+                  ? `${cause} (stalled after ${MAX_RESUMES} resumes)`
+                  : stalled,
                 transcript_segments: nextSegments,
               })
-              .eq("id", row.id);
+              .eq("id", row.id)
+              // Never flip a meeting that finished in the meantime.
+              .eq("processing_status", "transcribing");
             continue;
           }
 

@@ -8,6 +8,8 @@
  * are new and serve the segmented transcription worker.
  */
 
+import { extractTranscriptText } from "./segments.ts";
+
 const GEMINI_MODEL = "gemini-2.5-flash";
 
 /* ─── File API ──────────────────────────────────────────────────── */
@@ -179,7 +181,14 @@ export async function deleteGeminiFile(apiKey: string, fileUri: string): Promise
 
 /* ─── Transcription ─────────────────────────────────────────────── */
 
-/** One generateContent call over ONE segment file. Returns the raw text. */
+/**
+ * One generateContent call over ONE segment file. Returns the raw text.
+ *
+ * A 200 whose candidate finished normally with no words in it is a SILENT
+ * segment, not a failure: extractTranscriptText hands back NO_SPEECH_TEXT so
+ * the segment counts as done. Everything else (non-200, no candidates, an
+ * early finishReason such as SAFETY / RECITATION / MAX_TOKENS) still throws.
+ */
 export async function transcribeSegment(
   apiKey: string,
   fileUri: string,
@@ -210,9 +219,9 @@ export async function transcribeSegment(
   }
 
   const data = await resp.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  if (!text) throw new Error("Empty transcript returned from Gemini");
-  return text;
+  const extracted = extractTranscriptText(data);
+  if ("error" in extracted) throw new Error(extracted.error);
+  return extracted.text;
 }
 
 /* ─── Summary ───────────────────────────────────────────────────── */

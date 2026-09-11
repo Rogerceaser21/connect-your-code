@@ -243,3 +243,104 @@ export function buildSegmentPrompt(
     : "";
   return `Transcribe this audio recording of a meeting. This is part ${index + 1} of ${total} of the recording; it starts at ${startHms} of the meeting.${participantsLine} Format the output as a clean transcript with speaker labels. Do not include timestamps. Transcribe every sentence that is spoken, even if a passage is repeated. Be thorough and accurate.${overlapLine}`;
 }
+
+/* ─── Gemini response shape (pure) ──────────────────────────────── */
+
+/**
+ * What a segment's text becomes when Gemini legitimately hears nothing in it.
+ *
+ * NON-BLANK on purpose: firstMissingSegment / countMissingSegments / joinTranscript
+ * all treat a blank text as "this segment is not done yet", so a genuinely silent
+ * 10 minutes stored as "" would be re-transcribed until the attempt budget ran
+ * out and the whole meeting failed.
+ */
+export const NO_SPEECH_TEXT = "(no speech in this part)";
+
+/**
+ * Pull the transcript out of a Gemini generateContent response body (callers
+ * check resp.ok first, so this only ever sees a 200 body).
+ *
+ *  - no candidates                      -> error (quota/safety block on the prompt)
+ *  - finishReason present and not STOP  -> error naming the reason
+ *    (SAFETY / RECITATION / MAX_TOKENS: the text, if any, is not a transcript
+ *     of the whole segment, so it must not be stored as one)
+ *  - blank text with STOP / no reason   -> NO_SPEECH_TEXT (a silent stretch)
+ *  - otherwise                          -> the joined part texts
+ */
+export function extractTranscriptText(
+  responseJson: unknown,
+): { text: string } | { error: string } {
+  const data = (responseJson ?? {}) as Record<string, any>;
+  const candidate = (data.candidates ?? [])[0];
+  if (!candidate) {
+    const blocked = data.promptFeedback?.blockReason;
+    return {
+      error: blocked
+        ? `Gemini returned no candidates (blockReason ${blocked})`
+        : "Gemini returned no candidates",
+    };
+  }
+
+  const finishReason = candidate.finishReason ?? candidate.finish_reason ?? null;
+  const isStop = finishReason === null || finishReason === undefined ||
+    finishReason === "STOP" || finishReason === "FINISH_REASON_STOP" ||
+    finishReason === "FINISH_REASON_UNSPECIFIED";
+  if (!isStop) {
+    return { error: `Gemini stopped early (finishReason ${finishReason})` };
+  }
+
+  const parts = candidate.content?.parts;
+  const text = Array.isArray(parts)
+    ? parts.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("")
+    : "";
+  if (text.trim()) return { text };
+  return { text: NO_SPEECH_TEXT };
+}
+
+/* ─── Container sniffing + secret scrubbing (pure) ──────────────── */
+
+/** First four bytes of every WebM / Matroska file: EBML magic 1A 45 DF A3. */
+const EBML_MAGIC = [0x1a, 0x45, 0xdf, 0xa3];
+
+/**
+ * True only for a buffer that opens with the EBML magic. Browsers without
+ * MediaRecorder WebM support record audio/mp4 instead ("....ftyp"), which the
+ * init/lead cluster search cannot handle at all — callers fail fast on false.
+ */
+export function isWebm(bytes: Uint8Array | null | undefined): boolean {
+  if (!bytes || bytes.length < EBML_MAGIC.length) return false;
+  for (let i = 0; i < EBML_MAGIC.length; i++) {
+    if (bytes[i] !== EBML_MAGIC[i]) return false;
+  }
+  return true;
+}
+
+/** Lowercase hex of the first n bytes, space separated: "1a 45 df a3". */
+export function hexHead(bytes: Uint8Array | null | undefined, n = 4): string {
+  if (!bytes || bytes.length === 0) return "(empty)";
+  return Array.from(bytes.slice(0, n))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join(" ");
+}
+
+/**
+ * Make an error message safe to persist in processing_error (which the app
+ * shows on the meeting card).
+ *
+ * A Deno fetch failure embeds the request URL, and every Gemini URL carries
+ * `?key=<GEMINI_API_KEY>`; a Supabase failure can quote a service-role bearer.
+ * Both are replaced by "***".
+ */
+export function scrubSecrets(
+  message: unknown,
+  secrets: (string | null | undefined)[] = [],
+): string {
+  let out = message instanceof Error ? message.message : String(message ?? "");
+  out = out.replace(/key=[^&\s)"']+/g, "key=***");
+  for (const secret of secrets) {
+    if (typeof secret === "string" && secret.length >= 8) {
+      out = out.split(secret).join("***");
+    }
+  }
+  return out;
+}
