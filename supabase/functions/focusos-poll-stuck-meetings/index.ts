@@ -1,5 +1,12 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { generateSummary } from "../_shared/gemini.ts";
+import {
+  leaseIsValid,
+  releasedLease,
+  scrubSecrets,
+  type SegmentsState,
+} from "../_shared/segments.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -7,96 +14,13 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type",
 };
 
-const STUCK_AFTER_SECONDS = 90; // consider transcribing > 90s old as candidate to inspect
-const MAX_ATTEMPTS = 3;
-const MAX_CHAIN = 60; // max self-rescheduling iterations (~60 min)
-const SLEEP_MS = 60_000; // 60 seconds between iterations
+const STUCK_AFTER_SECONDS = 180; // a healthy segment worker touches the row every ~60 s
+const MAX_RESUMES = 12;          // 12 nudges is far more than a long meeting needs
+const MAX_CHAIN = 60;            // max self-rescheduling iterations (~60 min)
+const SLEEP_MS = 60_000;         // 60 seconds between iterations
 
 // @ts-ignore — provided by Supabase edge runtime
 declare const EdgeRuntime: { waitUntil: (p: Promise<unknown>) => void };
-
-/* ─── Summary helpers (mirror transcribe-meeting) ───────────────── */
-
-function stripMarkdown(text: string): string {
-  return text
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/\*([^*]+)\*/g, "$1")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/`([^`]+)`/g, "$1");
-}
-
-function getSummaryPrompt(transcript: string, durationSeconds: number): string {
-  const durationMin = Math.round(durationSeconds / 60);
-  const maxSections = durationMin < 5 ? 2 : durationMin < 30 ? 3 : 5;
-  return `Analyze this meeting transcript and provide a structured summary.
-CRITICAL RULES:
-1. Plain text only, no markdown.
-2. Maximum ${maxSections} sections, 1-3 short bullets each.
-3. Overview: 1-2 sentences.
-4. Return ONLY valid JSON: { "overview": "string", "outline": [{ "heading": "string", "points": ["string"] }] }
-
-Transcript:
-${transcript}`;
-}
-
-function parseSummary(rawText: string): string {
-  try {
-    const parsed = JSON.parse(rawText);
-    parsed.overview = stripMarkdown(parsed.overview || "");
-    if (parsed.outline) {
-      parsed.outline = parsed.outline.map((s: any) => ({
-        heading: stripMarkdown(s.heading || ""),
-        points: (s.points || []).map((p: string) => stripMarkdown(p)),
-      }));
-    }
-    return JSON.stringify(parsed);
-  } catch {
-    let cleaned = rawText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-    const jsonStart = cleaned.search(/[\{\[]/);
-    const jsonEnd = cleaned.lastIndexOf("}");
-    if (jsonStart !== -1 && jsonEnd !== -1) {
-      cleaned = cleaned.substring(jsonStart, jsonEnd + 1)
-        .replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
-      try {
-        const parsed = JSON.parse(cleaned);
-        parsed.overview = stripMarkdown(parsed.overview || "");
-        if (parsed.outline) {
-          parsed.outline = parsed.outline.map((s: any) => ({
-            heading: stripMarkdown(s.heading || ""),
-            points: (s.points || []).map((p: string) => stripMarkdown(p)),
-          }));
-        }
-        return JSON.stringify(parsed);
-      } catch {}
-    }
-    return JSON.stringify({ overview: stripMarkdown(rawText), outline: [] });
-  }
-}
-
-async function generateSummary(apiKey: string, transcript: string, durationSeconds: number): Promise<string> {
-  const prompt = getSummaryPrompt(transcript, durationSeconds);
-  const resp = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json" },
-      }),
-    }
-  );
-  if (!resp.ok) {
-    console.error("Summary generation failed:", await resp.text());
-    return JSON.stringify({ overview: "Summary generation failed.", outline: [] });
-  }
-  const data = await resp.json();
-  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  if (!rawText) return JSON.stringify({ overview: "No summary available.", outline: [] });
-  return parseSummary(rawText);
-}
-
-/* ─── Main handler ──────────────────────────────────────────────── */
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -122,7 +46,7 @@ serve(async (req) => {
     // Find candidates: in-flight rows whose last update is older than cutoff
     const { data: stuckRows, error: fetchErr } = await supabase
       .from("focusos_meetings")
-      .select("id, processing_status, gemini_transcribe_attempts, gemini_transcribe_started_at, gemini_file_uri, recording_gcs_path, transcription_text, summary, duration_seconds, updated_at")
+      .select("id, processing_status, processing_error, transcript_segments, transcription_text, summary, duration_seconds, updated_at")
       .in("processing_status", ["transcribing", "summarizing"])
       .lt("updated_at", cutoff);
 
@@ -135,10 +59,24 @@ serve(async (req) => {
 
     for (const row of rows) {
       try {
-        // Case A: transcript_text already present → just summarize
-        if (row.transcription_text && (!row.summary || row.processing_status === "summarizing")) {
+        // Case A (legacy): a whole-file transcript is already staged → just summarize.
+        // Only for rows the OLD pipeline staged: a row that carries a segment plan
+        // belongs to the segment worker even if a stale transcription_text is
+        // still on it (a legacy row re-opened by Retry), so it must not be
+        // summarised here and flipped to 'done' without a transcript_gcs_path.
+        const hasSegmentPlan = typeof (row.transcript_segments as any)?.total === "number";
+        if (
+          !hasSegmentPlan &&
+          row.transcription_text &&
+          (!row.summary || row.processing_status === "summarizing")
+        ) {
           console.log(`[poller] finishing summarization for ${row.id}`);
-          const summary = await generateSummary(GEMINI_API_KEY, row.transcription_text, row.duration_seconds || 0);
+          const summary = await generateSummary(
+            GEMINI_API_KEY,
+            row.transcription_text,
+            "concise",
+            row.duration_seconds || 0
+          );
           await supabase
             .from("focusos_meetings")
             .update({
@@ -148,48 +86,92 @@ serve(async (req) => {
               transcription_text: null,
               gemini_file_uri: null,
             })
-            .eq("id", row.id);
+            .eq("id", row.id)
+            // Guarded: the row must still be exactly where we read it. The status
+            // check alone is not enough (a worker can plan the row under an
+            // unchanged 'transcribing'), so the row's updated_at must also be
+            // older than the cutoff we selected with.
+            .eq("processing_status", row.processing_status)
+            .lt("updated_at", cutoff);
           continue;
         }
 
-        // Case B: stuck in transcribing with no transcript yet
+        // Case B: a segmented transcription whose worker chain went quiet.
         if (row.processing_status === "transcribing") {
-          const attempts = row.gemini_transcribe_attempts || 0;
-          if (attempts >= MAX_ATTEMPTS) {
-            console.log(`[poller] giving up on ${row.id} after ${attempts} attempts`);
-            await supabase
-              .from("focusos_meetings")
-              .update({
-                processing_status: "error",
-                processing_error: row.processing_error || `Transcription timed out after ${MAX_ATTEMPTS} attempts.`,
-              })
-              .eq("id", row.id);
+          const segments = (row.transcript_segments ?? null) as SegmentsState | null;
+
+          if (leaseIsValid(segments?.lease, Date.now())) {
+            console.log(`[poller] ${row.id}: segment ${segments?.lease?.segment} still leased — leaving it`);
             continue;
           }
 
-          if (!row.gemini_file_uri) {
-            await supabase
+          const resumes = (segments?.resumes ?? 0) + 1;
+          // The RELEASED SENTINEL, never null: the worker's takeLease filter is
+          // `transcript_segments->lease->>until < now` and a null there matches no
+          // row, so a poller that nulled the lease key would hand the worker a
+          // meeting it could never lease.
+          const nextSegments = { ...(segments ?? {}), resumes, lease: releasedLease() };
+
+          if (resumes > MAX_RESUMES) {
+            console.log(`[poller] giving up on ${row.id} after ${resumes - 1} resumes`);
+            // KEEP the cause the worker already wrote: "stalled after N resumes"
+            // on its own tells nobody why it stalled.
+            const stalled = `Transcription stalled after ${MAX_RESUMES} resumes`;
+            const cause = scrubSecrets(row.processing_error ?? "", [
+              supabaseServiceKey,
+              GEMINI_API_KEY,
+            ]).trim();
+            const { data: failed, error: failErr } = await supabase
               .from("focusos_meetings")
               .update({
                 processing_status: "error",
-                processing_error: "Gemini file expired before transcription completed. Please re-record.",
+                processing_error: cause
+                  ? `${cause} (stalled after ${MAX_RESUMES} resumes)`
+                  : stalled,
+                transcript_segments: nextSegments,
               })
-              .eq("id", row.id);
-            continue;
-          }
-
-          // Re-invoke transcribe-meeting (it will increment attempts itself)
-          console.log(`[poller] retrying transcription for ${row.id} (attempt ${attempts + 1}/${MAX_ATTEMPTS})`);
-          // Parse gcs path components
-          let gcsBucket = "";
-          let gcsFolder = "";
-          if (row.recording_gcs_path) {
-            const m = row.recording_gcs_path.match(/^gs:\/\/([^/]+)\/(.+)\/recording\./);
-            if (m) {
-              gcsBucket = m[1];
-              gcsFolder = m[2];
+              .eq("id", row.id)
+              // Never flip a meeting that finished in the meantime.
+              .eq("processing_status", "transcribing")
+              // …and never one that MOVED since this tick read it: the row must
+              // still be as stale as it was in the candidate query (writes to
+              // focusos_meetings bump updated_at), or a worker that just resumed
+              // it would be failed under its feet.
+              .lt("updated_at", cutoff)
+              .select("id");
+            if (failErr) {
+              console.warn(`[poller] ${row.id}: give-up write error — ${failErr.message}`);
+            } else if (!failed || failed.length === 0) {
+              console.log(`[poller] ${row.id}: moved since the read — not failing it this tick`);
             }
+            continue;
           }
+
+          /* The resumes counter is the poller's give-up budget, so the write that
+           * increments it must be CONDITIONAL on the row not having moved since
+           * the read above: a status still 'transcribing' AND an updated_at still
+           * older than this tick's cutoff. Without that, a worker that woke up
+           * between the read and the write (or a second poller chain) gets a
+           * resume charged against it every tick and a healthy meeting is failed
+           * at 12. 0 rows affected -> another chain or the worker owns this row,
+           * so skip it entirely this tick and do NOT invoke the worker.        */
+          const { data: bumped, error: bumpErr } = await supabase
+            .from("focusos_meetings")
+            .update({ transcript_segments: nextSegments })
+            .eq("id", row.id)
+            .eq("processing_status", "transcribing")
+            .lt("updated_at", cutoff)
+            .select("id");
+          if (bumpErr) {
+            console.warn(`[poller] ${row.id}: resume write error — ${bumpErr.message}`);
+            continue;
+          }
+          if (!bumped || bumped.length === 0) {
+            console.log(`[poller] ${row.id}: moved since the read — skipping this tick`);
+            continue;
+          }
+          console.log(`[poller] resuming segmented transcription for ${row.id} (resume ${resumes}/${MAX_RESUMES})`);
+
           fetch(`${supabaseUrl}/functions/v1/focusos-transcribe-meeting`, {
             method: "POST",
             headers: {
@@ -197,16 +179,8 @@ serve(async (req) => {
               Authorization: `Bearer ${supabaseServiceKey}`,
               apikey: supabaseServiceKey,
             },
-            body: JSON.stringify({
-              meetingId: row.id,
-              geminiFileUri: row.gemini_file_uri,
-              mimeType: "audio/webm",
-              participantNames: [],
-              durationSeconds: row.duration_seconds || 0,
-              gcsBucket,
-              gcsFolder,
-            }),
-          }).catch((e) => console.warn("[poller] retry invoke error:", e?.message));
+            body: JSON.stringify({ meetingId: row.id }),
+          }).catch((e) => console.warn("[poller] resume invoke error:", e?.message));
         }
       } catch (rowErr) {
         console.error(`[poller] error processing row ${row.id}:`, rowErr);
