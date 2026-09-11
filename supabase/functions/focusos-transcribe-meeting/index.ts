@@ -64,10 +64,13 @@ const corsHeaders = {
 };
 
 const SEGMENT_CHUNKS = 20;      // 20 x 30 s chunks = 10 min of audio per Gemini call
-// 5 min: STRICTLY above one segment's worst case, which is now bounded on every
-// leg — compose ~2 s + GCS->Gemini upload 60 s + wait-for-ACTIVE 60 s +
-// generateContent 120 s = 242 s. A lease that can expire while its owner is
-// still working is how two workers end up on one segment.
+// 5 min: above the TYPICAL segment (compose ~2 s + GCS->Gemini upload + ACTIVE
+// wait + generateContent, tens of seconds each). It is NOT above the sum of every
+// leg's timeout cap (a first segment i>0 can spend up to five 60 s GCS legs plus
+// 242 s of Gemini legs), so an owner CAN outlive its lease on a pathologically
+// slow day. Correctness never rests on the lease alone: every state write is
+// token-owned, so an expired owner stands down and at most one segment's Gemini
+// call is repeated.
 const LEASE_MS = 300_000;
 // 60 s: a segment may START at the very end of the budget, so the request's own
 // ceiling is BUDGET_MS + one worst-case segment (~242 s) + finalize, which keeps
@@ -501,6 +504,12 @@ serve(async (req) => {
        * Keep the texts and the plan, drop everything that stops work:
        * the failure attempts, the poller's resume budget, and any lease
        * (a retry deliberately pre-empts a worker that went quiet).      */
+      if (!state.lease || typeof state.lease !== "object") {
+        // The guarded write below filters on lease->>until; a missing or null
+        // lease key matches no row, so normalise it to the released sentinel
+        // first (same invariant as step b1, which runs too late for this branch).
+        state = await mergeState({ lease: releasedLease() });
+      }
       state = { ...state, attempts: {}, resumes: 0, lease: releasedLease() };
       // Guarded like takeLease: a lease that went live between the row read and
       // this write (a double Retry click, or the poller resuming at the same
@@ -883,6 +892,12 @@ serve(async (req) => {
           `[segment ${INSTANCE}] ${meetingId}: could not record the failure state —`,
           scrubSecrets(stateErr, [serviceKey, Deno.env.get("GEMINI_API_KEY")])
         );
+        if (leaseToken) {
+          // Ownership is unknown (the owned write itself failed), so never stamp
+          // an error that might land under another holder. The lease expires on
+          // its own and the poller resumes the meeting.
+          return json({ processed, leaseUnknown: segmentIndex, attempt: attemptCount });
+        }
       }
       await supabase
         .from("focusos_meetings")
