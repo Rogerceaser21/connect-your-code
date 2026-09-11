@@ -1747,7 +1747,9 @@ https://www.skyscanner.com`,
         // Save the rest of the edit rather than risk writing the wrong photo set.
         toast.error('Photos not saved, try again');
       } else {
-        const stored: string[] = Array.isArray(storedRow?.images) ? storedRow.images : [];
+        const stored: string[] = Array.isArray(storedRow?.images)
+          ? (storedRow.images as unknown[]).filter((p): p is string => typeof p === 'string')
+          : [];
         const removed = new Set(originalImages.filter(p => !paneImages.includes(p)));
         const added = paneImages.filter(p => !originalImages.includes(p));
         const final = stored.filter(p => !removed.has(p));
