@@ -236,9 +236,18 @@ export async function transcribeSegment(
         ],
         // temperature 0: a transcript is not a creative task, and a rerun of a
         // failed segment should produce the same words as the run before it.
+        //
+        // thinkingBudget 0: gemini-2.5-flash spends its output budget on thinking
+        // tokens before it writes a word, which is how a 10 minute segment came
+        // back MAX_TOKENS with an EMPTY candidate. With thinking off the same call
+        // returns the full transcript (evidence handoff/evidence/mt0/
+        // gemini-seg0-cfg-think-off.txt and gemini-segB-cfg-think-off.txt, which
+        // were captured with exactly this generationConfig). The SUMMARY call is
+        // left alone: it is short, and its reasoning earns its tokens.
         generationConfig: {
           maxOutputTokens: TRANSCRIBE_MAX_OUTPUT_TOKENS,
           temperature: 0,
+          thinkingConfig: { thinkingBudget: 0 },
         },
       }),
       signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),

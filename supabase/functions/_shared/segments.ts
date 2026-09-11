@@ -13,11 +13,48 @@ export interface SegmentPlan {
   lastChunk: number;
 }
 
-/** The lease a worker takes while it transcribes one segment. */
+/**
+ * The lease a worker takes while it transcribes one segment.
+ *
+ * ALWAYS an object, NEVER null: the lease filters are PLAIN PostgREST filters on
+ * the jsonb path (`transcript_segments->lease->>until` / `->>token`), because any
+ * `or=(...)` / `and=(...)` logic tree on a PATCH is rejected by this project's
+ * PostgREST with 42703 "column ... does not exist" (live-probed 2026-09-11, the
+ * same filter on a GET is 200). A plain filter cannot say "is null OR expired",
+ * and a NULL on the left of `<` matches nothing, so a released lease is written
+ * as the SENTINEL (see releasedLease) instead of null.
+ */
 export interface SegmentLease {
+  /** The segment this lease covers; -1 in the released sentinel. */
   segment: number;
   /** ISO timestamp (or epoch ms) after which the lease is dead. */
   until: string | number;
+  /**
+   * Random per-take id. The ONLY thing that proves a write belongs to the worker
+   * that took the lease: `->>token = <mine>` is one plain filter, evaluated
+   * inside Postgres at write time.
+   */
+  token: string;
+}
+
+/**
+ * `until` of the released sentinel: the epoch, so it is in the past forever and
+ * sorts BEFORE any real timestamp as TEXT too (PostgREST compares a `->>` path
+ * as text, and toISOString() is fixed-width, so lexical order === chronological
+ * order).
+ */
+export const RELEASED_LEASE_UNTIL = "1970-01-01T00:00:00.000Z";
+
+/**
+ * A FRESH released-lease sentinel: "no worker holds this meeting".
+ *
+ * A function, not a shared const, so no caller can mutate the value every other
+ * write depends on. segment -1 (no segment) + an epoch `until` (expired) + an
+ * empty token (matches nobody's write), which is exactly what takeLease's
+ * `->>until < now` filter needs to see to grant the lease.
+ */
+export function releasedLease(): SegmentLease {
+  return { segment: -1, until: RELEASED_LEASE_UNTIL, token: "" };
 }
 
 /** Shape of focusos_meetings.transcript_segments. */
@@ -29,6 +66,10 @@ export interface SegmentsState {
   texts: Record<string, string>;
   attempts: Record<string, number>;
   resumes: number;
+  /**
+   * Nullable for READS only (a legacy row, or a row planned before the sentinel
+   * rule). Nothing ever WRITES null here — see SegmentLease / releasedLease.
+   */
   lease: SegmentLease | null;
   /**
    * Set to "webm" once chunk 00000 has been PROVEN to carry the EBML magic.
@@ -187,12 +228,19 @@ export function countMissingSegments(
   return missing;
 }
 
-/** True only while a lease exists and its `until` is still in the future. */
+/**
+ * True only while a REAL lease exists and its `until` is still in the future.
+ *
+ * The released sentinel (segment -1, `until` at the epoch) is NOT valid, and a
+ * negative segment is rejected whatever its `until` says: the sentinel means "no
+ * worker holds this meeting", so it must never read as busy.
+ */
 export function leaseIsValid(
   lease: SegmentLease | null | undefined,
   nowMs: number,
 ): boolean {
   if (!lease || lease.until === null || lease.until === undefined) return false;
+  if (typeof lease.segment === "number" && lease.segment < 0) return false;
   const until = typeof lease.until === "number"
     ? lease.until
     : Date.parse(String(lease.until));

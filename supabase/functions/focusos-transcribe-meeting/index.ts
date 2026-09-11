@@ -33,6 +33,7 @@ import {
   leaseIsValid,
   parseRecordingPath,
   planSegments,
+  releasedLease,
   scrubSecrets,
   segmentObjectName,
   segmentStartSeconds,
@@ -191,6 +192,10 @@ serve(async (req) => {
 
   let meetingId = "";
   let segmentIndex: number | null = null;
+  // The lease token this worker currently holds (null between segments). The
+  // failure path needs it: releasing a lease is an OWNED write, and a worker that
+  // never got the lease must not touch the key at all.
+  let leaseToken: string | null = null;
   let state: SegmentsState | null = null;
   const processed: number[] = [];
 
@@ -237,24 +242,32 @@ serve(async (req) => {
   };
 
   /**
-   * Merge + write ONLY while this worker still owns segment i.
+   * Merge + write ONLY while this worker still HOLDS the lease it took.
    *
    * WHY a second variant: mergeState's guard is the status alone, so a worker
    * whose lease expired mid-segment (a slow Gemini call) could still overwrite
-   * transcript_segments AFTER a second worker legitimately took segment i —
-   * two workers leapfrogging through the same segments. The filter below makes
-   * the CURRENT lease part of the write condition, evaluated inside Postgres:
+   * transcript_segments AFTER a second worker legitimately took that segment —
+   * two workers leapfrogging through the same segments. The token makes the
+   * CURRENT lease part of the write condition, evaluated inside Postgres:
    *
    *   id = meetingId
    *   AND processing_status = 'transcribing'
-   *   AND ( transcript_segments->>'lease' IS NULL          -- already released
-   *         OR transcript_segments->'lease'->>'segment' = i )  -- still ours
+   *   AND transcript_segments->'lease'->>'token' = <the token WE were granted>
    *
-   * Returns false when the write touched no row ("lease lost"): the caller
-   * stands down and writes nothing further. A real DB error still throws.
+   * THREE PLAIN FILTERS, no logic tree. This project's PostgREST rejects ANY
+   * `or=(...)` / `and=(...)` on a PATCH with 42703 "column ... does not exist",
+   * even for a plain column (live-probed 2026-09-11: the same tree on a GET is
+   * 200, a plain filter on a jsonb path on a PATCH is 200). That is what killed
+   * every meeting at its first lease take before this round.
+   *
+   * There is no "already released" arm: a lease that is not ours is a lease we
+   * LOST, and the owner's state is the authoritative one.
+   *
+   * Returns false when the write touched no row ("lease lost"): the caller stands
+   * down and writes nothing further. A real DB error still throws.
    */
   const mergeStateOwned = async (
-    i: number,
+    token: string,
     patch: Partial<SegmentsState>,
   ): Promise<boolean> => {
     const merged = await mergeRead(patch);
@@ -263,16 +276,13 @@ serve(async (req) => {
       .update({ transcript_segments: merged })
       .eq("id", meetingId)
       .eq("processing_status", "transcribing")
-      .or(
-        "transcript_segments->>lease.is.null," +
-        `transcript_segments->lease->>segment.eq.${i}`
-      )
+      .eq("transcript_segments->lease->>token", token)
       .select("id");
     if (error) throw new Error(`Owned state write failed: ${error.message}`);
     if (!data || data.length === 0) {
       console.warn(
-        `[segment ${INSTANCE}] ${meetingId}: lease lost on segment ${i} — ` +
-        `another worker owns it, standing down without writing`
+        `[segment ${INSTANCE}] ${meetingId}: lease lost (token no longer ours) — ` +
+        `another worker owns this segment, standing down without writing`
       );
       return false;
     }
@@ -290,37 +300,40 @@ serve(async (req) => {
    *
    *   id = meetingId
    *   AND processing_status = 'transcribing'
-   *   AND ( transcript_segments->>'lease' IS NULL            -- key missing OR json null
-   *         OR transcript_segments->'lease'->>'until' IS NULL
-   *         OR transcript_segments->'lease'->>'until' < now )
+   *   AND transcript_segments->'lease'->>'until' < now
    *
-   * `->>` (not `->`) on the lease key is deliberate: after a finalize or a
-   * release the key holds JSON null, and `(jsonb->'lease') IS NULL` is FALSE for
-   * that, while `(jsonb->>'lease') IS NULL` is TRUE for both a missing key and a
-   * JSON null. `until` is always written as new Date().toISOString(), so the
-   * text comparison against nowIso is chronological.
+   * ONE PLAIN FILTER on the lease, because a logic tree is not available here:
+   * any `or=(...)` on a PATCH is 42703 on this project (live-probed 2026-09-11).
+   * A plain `<` cannot also mean "or it is null", which is exactly why a released
+   * lease is the SENTINEL (segment -1, `until` at the epoch) and never null — an
+   * SQL NULL on the left of `<` matches no row, i.e. a null lease would be
+   * un-takeable.
+   *
+   * `until` is always written with new Date().toISOString(): PostgREST compares a
+   * `->>` path as TEXT, and that format is fixed-width, so the text comparison
+   * against nowIso (same format) is chronological.
+   *
+   * Returns the granted TOKEN (the caller passes it to every later write) or null
+   * when someone else holds a live lease.
    */
-  const takeLease = async (i: number): Promise<boolean> => {
+  const takeLease = async (i: number): Promise<string | null> => {
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
+    const token = crypto.randomUUID();
     const merged = await mergeRead({
-      lease: { segment: i, until: new Date(now + LEASE_MS).toISOString() },
+      lease: { segment: i, until: new Date(now + LEASE_MS).toISOString(), token },
     });
     const { data, error } = await supabase
       .from("focusos_meetings")
       .update({ transcript_segments: merged })
       .eq("id", meetingId)
       .eq("processing_status", "transcribing")
-      .or(
-        "transcript_segments->>lease.is.null," +
-        "transcript_segments->lease->>until.is.null," +
-        `transcript_segments->lease->>until.lt.${nowIso}`
-      )
+      .lt("transcript_segments->lease->>until", nowIso)
       .select("id");
     if (error) throw new Error(`Lease update failed: ${error.message}`);
-    if (!data || data.length === 0) return false;
+    if (!data || data.length === 0) return null;
     state = merged;
-    return true;
+    return token;
   };
 
   /** The live processing_status, re-read from the row (null when it is gone). */
@@ -474,7 +487,9 @@ serve(async (req) => {
         // A retry starts the resume budget over; otherwise preserve the count
         // the poller may already have written.
         resumes: isRetry ? 0 : ((meeting.transcript_segments as any)?.resumes ?? 0),
-        lease: null,
+        // The RELEASED SENTINEL, never null: takeLease's filter is
+        // `lease->>until < now`, and a null there matches no row at all.
+        lease: releasedLease(),
       };
       await supabase
         .from("focusos_meetings")
@@ -486,7 +501,7 @@ serve(async (req) => {
        * Keep the texts and the plan, drop everything that stops work:
        * the failure attempts, the poller's resume budget, and any lease
        * (a retry deliberately pre-empts a worker that went quiet).      */
-      state = { ...state, attempts: {}, resumes: 0, lease: null };
+      state = { ...state, attempts: {}, resumes: 0, lease: releasedLease() };
       await supabase
         .from("focusos_meetings")
         .update({ transcript_segments: state, processing_error: null })
@@ -494,6 +509,21 @@ serve(async (req) => {
       console.log(
         `[segment ${INSTANCE}] ${meetingId}: retry — attempts/lease/resumes cleared, ` +
         `${countMissingSegments(state.texts, state.total)}/${state.total} segment(s) still missing`
+      );
+    }
+
+    /* ─── b1. INVARIANT: the lease key is an OBJECT, never null ─────
+     * takeLease's only lease filter is `transcript_segments->lease->>until < now`
+     * (a PATCH cannot carry an or= tree on this project — 42703), and an SQL NULL
+     * on the left of `<` matches NO row. So a row that reached here without a
+     * lease object (a row planned before this rule, or a hand-edited one) would
+     * be permanently un-leasable. Normalise it to the released sentinel first;
+     * this is a status-guarded plain write, and on the normal path it is skipped
+     * because the planner / retry branch already wrote a sentinel.            */
+    if (!state.lease || typeof state.lease !== "object") {
+      state = await mergeState({ lease: releasedLease() });
+      console.log(
+        `[segment ${INSTANCE}] ${meetingId}: lease key was absent — released sentinel written`
       );
     }
 
@@ -536,11 +566,14 @@ serve(async (req) => {
     }
 
     /* ─── d. Transcribe ONE segment ────────────────────────────── */
-    const runSegment = async (i: number): Promise<boolean> => {
+    // `token` is the lease token takeLease granted for segment i (a parameter, not
+    // the outer leaseToken, so nothing here can shadow the failure path's copy).
+    const runSegment = async (i: number, token: string): Promise<boolean> => {
       const total = state!.total;
       // The lease on segment i is ALREADY held: the caller took it with
-      // takeLease(i) (one conditional UPDATE), which is the only safe way to
-      // claim it when three different callers can start this worker.
+      // takeLease(i) (one conditional UPDATE) and passes the TOKEN it was
+      // granted, which is the only safe way to claim a segment when three
+      // different callers can start this worker.
 
       const plan = planSegments(state!.chunkCount, state!.segmentChunks)[i];
       if (!plan) throw new Error(`No plan for segment ${i} of ${total}`);
@@ -630,7 +663,10 @@ serve(async (req) => {
       // ONE owned write does both halves — store the text and release the lease
       // — so a worker whose lease expired mid-call cannot overwrite the state of
       // the worker that legitimately took segment i.
-      const kept = await mergeStateOwned(i, { texts: { [String(i)]: text }, lease: null });
+      const kept = await mergeStateOwned(token, {
+        texts: { [String(i)]: text },
+        lease: releasedLease(),
+      });
 
       try {
         await deleteGeminiFile(GEMINI_API_KEY, fileUri);
@@ -688,17 +724,25 @@ serve(async (req) => {
           );
           break;
         }
-        // ONE conditional UPDATE decides who owns this segment.
-        if (!(await takeLease(next))) {
+        // The error label belongs to THIS segment from here on: a takeLease
+        // failure is "Segment i/N: ...", not "Finalize: ..." (it happens before
+        // any segment work, and reading "Finalize" on a meeting with 8 missing
+        // segments sent the last round of diagnosis down the wrong path).
+        segmentIndex = next;
+        // ONE conditional UPDATE decides who owns this segment; it hands back the
+        // token every later write of ours must carry.
+        const token = await takeLease(next);
+        if (!token) {
           console.log(
             `[segment ${INSTANCE}] ${meetingId}: segment ${next} was leased by another ` +
             `worker — standing down after ${processed.length} segment(s)`
           );
           return json({ processed, busy: true });
         }
-        segmentIndex = next;
-        const kept = await runSegment(next);
+        leaseToken = token;
+        const kept = await runSegment(next, token);
         segmentIndex = null;
+        leaseToken = null;
         if (!kept) {
           // The lease expired under us and another worker owns segment `next`.
           // Write NOTHING more (the owner's state is authoritative) and let it
@@ -755,7 +799,7 @@ serve(async (req) => {
       const finalState: SegmentsState = {
         ...state,
         texts: {},
-        lease: null,
+        lease: releasedLease(),
       };
 
       const { data: finalized, error: updateError } = await supabase
@@ -798,17 +842,19 @@ serve(async (req) => {
 
       const attemptCount = ((state?.attempts ?? {})[key] ?? 0) + 1;
       try {
-        if (segmentIndex === null) {
-          // Finalize failure: no lease is held (the last segment's write
-          // released it), so do not touch the lease key at all.
-          await mergeState({ attempts: { [key]: attemptCount } });
-        } else {
-          // Same ownership condition as the success path: release ONLY our own
-          // lease, never one a second worker has since taken.
-          await mergeStateOwned(segmentIndex, {
+        if (leaseToken) {
+          // We hold the lease: record the attempt AND release it (the sentinel,
+          // never null) in ONE token-owned write, so a lease a second worker has
+          // since taken is left exactly as it is.
+          await mergeStateOwned(leaseToken, {
             attempts: { [key]: attemptCount },
-            lease: null,
+            lease: releasedLease(),
           });
+        } else {
+          // No lease is held — a finalize failure (the last segment's write
+          // released it) or a takeLease that threw before it was granted — so
+          // record the attempt only and do not touch the lease key.
+          await mergeState({ attempts: { [key]: attemptCount } });
         }
       } catch (stateErr) {
         console.warn(

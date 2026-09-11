@@ -17,6 +17,8 @@ import {
   NO_SPEECH_TEXT,
   parseRecordingPath,
   planSegments,
+  RELEASED_LEASE_UNTIL,
+  releasedLease,
   scrubSecrets,
   segmentObjectName,
   segmentStartSeconds,
@@ -140,15 +142,70 @@ Deno.test("leaseIsValid: null, past and future", () => {
   assertEquals(leaseIsValid(null, now), false);
   assertEquals(leaseIsValid(undefined, now), false);
   assertEquals(
-    leaseIsValid({ segment: 0, until: new Date(now - 1000).toISOString() }, now),
+    leaseIsValid({ segment: 0, until: new Date(now - 1000).toISOString(), token: "t" }, now),
     false,
   );
   assertEquals(
-    leaseIsValid({ segment: 0, until: new Date(now + 180_000).toISOString() }, now),
+    leaseIsValid({ segment: 0, until: new Date(now + 180_000).toISOString(), token: "t" }, now),
     true,
   );
-  assertEquals(leaseIsValid({ segment: 0, until: now + 5 }, now), true);
-  assertEquals(leaseIsValid({ segment: 0, until: "not-a-date" }, now), false);
+  assertEquals(leaseIsValid({ segment: 0, until: now + 5, token: "t" }, now), true);
+  assertEquals(leaseIsValid({ segment: 0, until: "not-a-date", token: "t" }, now), false);
+});
+
+Deno.test("leaseIsValid: the RELEASED SENTINEL is never valid", () => {
+  const now = Date.UTC(2026, 8, 11, 12, 0, 0);
+  // the sentinel a release / plan / poller resume writes instead of null
+  assertEquals(leaseIsValid(releasedLease(), now), false);
+  assertEquals(
+    leaseIsValid({ segment: -1, until: RELEASED_LEASE_UNTIL, token: "" }, now),
+    false,
+  );
+  // a negative segment is not valid even with a FUTURE until: "no segment" wins
+  assertEquals(
+    leaseIsValid({ segment: -1, until: new Date(now + 300_000).toISOString(), token: "x" }, now),
+    false,
+  );
+  // …and the sentinel is still valid-looking for segment 0 when it is real
+  assertEquals(
+    leaseIsValid({ segment: 0, until: new Date(now + 300_000).toISOString(), token: "x" }, now),
+    true,
+  );
+});
+
+Deno.test("releasedLease: shape, freshness, and TEXT-order proof", () => {
+  assertEquals(releasedLease(), { segment: -1, until: RELEASED_LEASE_UNTIL, token: "" });
+  assertEquals(RELEASED_LEASE_UNTIL, "1970-01-01T00:00:00.000Z");
+  // a FRESH object every call: nothing can mutate the value other writes rely on
+  const a = releasedLease();
+  const b = releasedLease();
+  assertEquals(a === b, false);
+  a.segment = 99;
+  assertEquals(releasedLease().segment, -1);
+  // PostgREST compares `lease->>until` as TEXT, so the sentinel must sort BEFORE
+  // any real timestamp lexically — that is what makes `->>until < now` grant the
+  // lease on a released meeting (a null there would match no row at all).
+  const nowIso = new Date(Date.UTC(2026, 8, 11, 12, 0, 0)).toISOString();
+  assertEquals(RELEASED_LEASE_UNTIL < nowIso, true);
+  assertEquals(new Date(Date.UTC(1999, 0, 1)).toISOString() < nowIso, true);
+  // a LIVE lease's until sorts after now, so its row is NOT matched
+  const liveIso = new Date(Date.UTC(2026, 8, 11, 12, 5, 0)).toISOString();
+  assertEquals(liveIso < nowIso, false);
+});
+
+Deno.test("leaseIsValid: a token-bearing live lease is valid, token value is irrelevant", () => {
+  const now = Date.UTC(2026, 8, 11, 12, 0, 0);
+  const until = new Date(now + 300_000).toISOString();
+  assertEquals(leaseIsValid({ segment: 3, until, token: crypto.randomUUID() }, now), true);
+  assertEquals(leaseIsValid({ segment: 3, until, token: "" }, now), true);
+  // an EXPIRED lease stays invalid however good its token looks
+  assertEquals(
+    leaseIsValid(
+      { segment: 3, until: new Date(now - 1).toISOString(), token: crypto.randomUUID() },
+      now,
+    ),
+    false,
+  );
 });
 
 Deno.test("chunkObjectName: 5-digit zero padding", () => {
