@@ -75,3 +75,9 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+        # Pages names a deployment by GITHUB_SHA and skips a second deployment that
+        # carries the same name. A fast-forward merge pushes main at the sha the
+        # preview branch already deployed, so the main run "succeeded" without
+        # changing the site (v66, 2026-09-11). Make every run's version unique.
+        env:
+          GITHUB_SHA: ${{ github.sha }}-${{ github.run_id }}
