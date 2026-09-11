@@ -63,15 +63,18 @@ interface Meeting {
 
 /**
  * done/total for a transcript_segments blob, or null when the run has no plan yet
- * (column null, no `total`, or a nonsense total). `done` counts the segments that
- * already carry text, so it is 0 on a freshly planned run rather than null.
+ * (column null/absent, no `total`, or a nonsense total: non-numeric, NaN, <= 0).
+ * `done` counts the segments that already carry text, so it is 0 on a freshly
+ * planned run rather than null, and it is CLAMPED to the plan: a ledger that
+ * carries more texts than `total` (a re-planned run, a retry that re-segmented
+ * the audio) renders "8/8", never "9/8".
  */
 const segmentProgress = (segments: unknown): { done: number; total: number } | null => {
   if (!segments || typeof segments !== 'object') return null;
   const { total, texts } = segments as TranscriptSegments;
   if (typeof total !== 'number' || !Number.isFinite(total) || total <= 0) return null;
-  const done = texts && typeof texts === 'object' ? Object.keys(texts).length : 0;
-  return { done, total };
+  const counted = texts && typeof texts === 'object' ? Object.keys(texts).length : 0;
+  return { done: Math.min(counted, total), total };
 };
 
 interface Project {
@@ -184,6 +187,15 @@ const Meetings = () => {
   const [recoveringSession, setRecoveringSession] = useState(false);
   const failedSessionRef = useRef<string | null>(null);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The status poll asks for transcript_segments, which the live table does not carry
+  // until the server half of this wave migrates it. PostgREST answers an unknown
+  // column with HTTP 400 / code 42703, and a swallowed 400 means the poll never sees
+  // 'done' or 'error': no navigate, no toast, the banner spins for ever (Retry, a
+  // fresh recording and orphan recovery alike). So the FIRST 42703 downgrades to the
+  // two-column select and is remembered here, and every later tick asks the narrow
+  // question directly - one 400 per mount, never one per tick. Once the column exists
+  // the wide select simply succeeds and this stays false.
+  const noSegmentsColumnRef = useRef(false);
 
   // Meeting sharing info: receiverMeetingId -> { sender name }
   const [meetingSharingMap, setMeetingSharingMap] = useState<Record<string, { name: string }>>({});
@@ -341,11 +353,30 @@ const Meetings = () => {
     if (!processingMeetingId) return;
 
     const poll = async () => {
-      const { data, error } = await (supabase as any)
-        .from('focusos_meetings')
-        .select('processing_status, processing_error, transcript_segments')
-        .eq('id', processingMeetingId)
-        .single();
+      const read = (withSegments: boolean) =>
+        (supabase as any)
+          .from('focusos_meetings')
+          .select(
+            withSegments
+              ? 'processing_status, processing_error, transcript_segments'
+              : 'processing_status, processing_error',
+          )
+          .eq('id', processingMeetingId)
+          .single();
+
+      let { data, error } = await read(!noSegmentsColumnRef.current);
+
+      // Pre-migration backend tolerance: the column is not there yet, so re-ask the
+      // same question without it and carry on with no segment counts.
+      if (
+        error &&
+        !noSegmentsColumnRef.current &&
+        (error.code === '42703' ||
+          String(error.message ?? '').includes('transcript_segments'))
+      ) {
+        noSegmentsColumnRef.current = true;
+        ({ data, error } = await read(false));
+      }
 
       if (error || !data) return;
 
@@ -816,17 +847,29 @@ const Meetings = () => {
       // and PROVE it landed: on 2026-09-09 a Retry left gemini_transcribe_attempts at
       // 4, so the worker refused the run it had just been asked to make. A failed
       // reset means no invoke at all.
-      const { error: resetError } = await (supabase as any)
+      //
+      // The proof has to be the STORED ROW. An update().eq() with no .select() writes
+      // zero rows for a meeting that has vanished or that RLS filters out, answers 204,
+      // and supabase-js reports no error at all - "it worked" was being taken on trust.
+      // .select(...).single() brings the written values back in the same round trip.
+      const { data: resetRow, error: resetError } = await (supabase as any)
         .from('focusos_meetings')
         .update({
           processing_status: 'transcribing',
           processing_error: null,
           gemini_transcribe_attempts: 0,
         })
-        .eq('id', meeting.id);
+        .eq('id', meeting.id)
+        .select('processing_status, gemini_transcribe_attempts')
+        .single();
 
-      if (resetError) {
-        console.error('Retry reset failed:', resetError);
+      if (
+        resetError ||
+        !resetRow ||
+        resetRow.processing_status !== 'transcribing' ||
+        resetRow.gemini_transcribe_attempts !== 0
+      ) {
+        console.error('Retry reset failed:', resetError ?? resetRow);
         toast.error('Could not reset the meeting for retry');
         return;
       }
