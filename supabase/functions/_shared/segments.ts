@@ -30,6 +30,12 @@ export interface SegmentsState {
   attempts: Record<string, number>;
   resumes: number;
   lease: SegmentLease | null;
+  /**
+   * Set to "webm" once chunk 00000 has been PROVEN to carry the EBML magic.
+   * Absent on a row whose container was never sniffed, which is what makes the
+   * worker download chunk 0 once and fail fast on an mp4 recording.
+   */
+  format?: "webm";
 }
 
 export const DEFAULT_SEGMENT_CHUNKS = 20; // 20 x 30 s = 10 min of audio per Gemini call
@@ -194,6 +200,26 @@ export function leaseIsValid(
   return until > nowMs;
 }
 
+/**
+ * Split focusos_meetings.recording_gcs_path into its bucket and recording folder.
+ *
+ * TWO shapes exist in production, both written by focusos-process-meeting:
+ *   gs://<bucket>/<folder>/recording.webm      multi-chunk recordings (composed)
+ *   gs://<bucket>/<folder>/chunks/00000.webm   chunk_count === 1, i.e. under
+ *                                              ~30 s: compose is skipped and the
+ *                                              single chunk IS the recording.
+ * Returns null for anything else (a caller turns that into a readable error).
+ */
+export function parseRecordingPath(
+  path: string | null | undefined,
+): { bucket: string; folder: string } | null {
+  const match = String(path ?? "").match(
+    /^gs:\/\/([^/]+)\/(.+?)\/(?:recording\.[^/]+|chunks\/\d{5}\.webm)$/,
+  );
+  if (!match) return null;
+  return { bucket: match[1], folder: match[2] };
+}
+
 /** GCS object name of chunk `i` inside a recording folder. */
 export function chunkObjectName(folder: string, i: number): string {
   return `${folder}/chunks/${String(i).padStart(5, "0")}.webm`;
@@ -257,13 +283,23 @@ export function buildSegmentPrompt(
 export const NO_SPEECH_TEXT = "(no speech in this part)";
 
 /**
+ * Appended to a segment whose Gemini response hit the output-token cap. It is
+ * part of the stored transcript on purpose: a reader must be able to see where
+ * the words stop, and the join step keeps the marker in place.
+ */
+export const TRUNCATED_MARKER = "[transcript truncated: output limit]";
+
+/**
  * Pull the transcript out of a Gemini generateContent response body (callers
  * check resp.ok first, so this only ever sees a 200 body).
  *
  *  - no candidates                      -> error (quota/safety block on the prompt)
- *  - finishReason present and not STOP  -> error naming the reason
- *    (SAFETY / RECITATION / MAX_TOKENS: the text, if any, is not a transcript
- *     of the whole segment, so it must not be stored as one)
+ *  - MAX_TOKENS WITH text               -> that text + TRUNCATED_MARKER, and the
+ *    segment counts as DONE: ten minutes of real transcript minus its tail beats
+ *    three more identical calls that hit the same cap and fail the meeting.
+ *  - MAX_TOKENS with NO text            -> error (nothing was heard at all)
+ *  - any other non-STOP finishReason    -> error naming the reason (SAFETY /
+ *    RECITATION: the response is not a transcript)
  *  - blank text with STOP / no reason   -> NO_SPEECH_TEXT (a silent stretch)
  *  - otherwise                          -> the joined part texts
  */
@@ -285,7 +321,9 @@ export function extractTranscriptText(
   const isStop = finishReason === null || finishReason === undefined ||
     finishReason === "STOP" || finishReason === "FINISH_REASON_STOP" ||
     finishReason === "FINISH_REASON_UNSPECIFIED";
-  if (!isStop) {
+  const isMaxTokens = finishReason === "MAX_TOKENS" ||
+    finishReason === "FINISH_REASON_MAX_TOKENS";
+  if (!isStop && !isMaxTokens) {
     return { error: `Gemini stopped early (finishReason ${finishReason})` };
   }
 
@@ -293,6 +331,13 @@ export function extractTranscriptText(
   const text = Array.isArray(parts)
     ? parts.map((part: any) => (typeof part?.text === "string" ? part.text : "")).join("")
     : "";
+
+  if (isMaxTokens) {
+    // Keep what was heard, mark the cut, count the segment done.
+    if (text.trim()) return { text: `${text}\n${TRUNCATED_MARKER}` };
+    return { error: `Gemini stopped early (finishReason ${finishReason})` };
+  }
+
   if (text.trim()) return { text };
   return { text: NO_SPEECH_TEXT };
 }

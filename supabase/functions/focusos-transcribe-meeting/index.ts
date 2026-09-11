@@ -31,6 +31,7 @@ import {
   joinTranscript,
   leadObjectName,
   leaseIsValid,
+  parseRecordingPath,
   planSegments,
   scrubSecrets,
   segmentObjectName,
@@ -62,9 +63,23 @@ const corsHeaders = {
 };
 
 const SEGMENT_CHUNKS = 20;      // 20 x 30 s chunks = 10 min of audio per Gemini call
-const LEASE_MS = 180_000;       // a worker owns the segment it is on for 3 min
-const BUDGET_MS = 100_000;      // stop STARTING segments after this much wall clock
+// 5 min: STRICTLY above one segment's worst case, which is now bounded on every
+// leg — compose ~2 s + GCS->Gemini upload 60 s + wait-for-ACTIVE 60 s +
+// generateContent 120 s = 242 s. A lease that can expire while its owner is
+// still working is how two workers end up on one segment.
+const LEASE_MS = 300_000;
+// 60 s: a segment may START at the very end of the budget, so the request's own
+// ceiling is BUDGET_MS + one worst-case segment (~242 s) + finalize, which keeps
+// it under the 400 s edge-function wall clock.
+const BUDGET_MS = 60_000;       // stop STARTING segments after this much wall clock
 const FILE_ACTIVE_CAP_MS = 60_000;
+// The edge runtime's own wall clock, and what finalize needs inside it: the
+// summary is one more Gemini call (bounded at 120 s) plus the transcript upload
+// and the artifact cleanup. A request that already spent WALL_CLOCK_MS minus
+// this reserve on segments hands the finalize to a fresh worker rather than
+// being cut off in the middle of it.
+const WALL_CLOCK_MS = 400_000;
+const FINALIZE_RESERVE_MS = 150_000;
 const MAX_SEGMENT_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 5_000; // x attempt number, retry path only
 const KICK_ABORT_MS = 1_500;    // how long we stay connected to the next worker
@@ -98,8 +113,6 @@ function armPoller(supabaseUrl: string, serviceKey: string, chainCount = 0) {
     // waitUntil so the POST survives this request returning; the abort keeps us
     // from waiting for the poller's whole tick.
     EdgeRuntime.waitUntil((async () => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), KICK_ABORT_MS);
       try {
         await fetch(pollerUrl, {
           method: "POST",
@@ -109,13 +122,11 @@ function armPoller(supabaseUrl: string, serviceKey: string, chainCount = 0) {
             apikey: serviceKey,
           },
           body: JSON.stringify({ chainCount }),
-          signal: controller.signal,
+          signal: AbortSignal.timeout(KICK_ABORT_MS),
         });
       } catch (e) {
         const name = (e as { name?: string })?.name ?? String(e);
         console.log(`[segment ${INSTANCE}] armPoller released (${name})`);
-      } finally {
-        clearTimeout(timer);
       }
     })());
   } catch (e) {
@@ -137,16 +148,14 @@ function kickSelf(
   delayMs = 0
 ) {
   const selfUrl = `${supabaseUrl}/functions/v1/focusos-transcribe-meeting`;
-  // Every handover also re-arms the watchdog: if this kick is the one that gets
-  // lost, the poller resumes the chain instead of the meeting hanging.
-  armPoller(supabaseUrl, serviceKey, 0);
+  // NO armPoller here. Each request arms the watchdog EXACTLY once (right after
+  // the plan is durable), and the callee arms it again for itself; arming from
+  // inside the handover made every hop start a second 60-tick poller chain.
   try {
     EdgeRuntime.waitUntil((async () => {
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), KICK_ABORT_MS);
       try {
-        // Bounded by the abort above: this never waits for the segments the
+        // Bounded by the abort signal: this never waits for the segments the
         // next worker is about to do, only for the request to be delivered.
         await fetch(selfUrl, {
           method: "POST",
@@ -156,15 +165,13 @@ function kickSelf(
             apikey: serviceKey,
           },
           body: JSON.stringify({ meetingId }),
-          signal: controller.signal,
+          signal: AbortSignal.timeout(KICK_ABORT_MS),
         });
       } catch (e) {
         // AbortError is the EXPECTED outcome, not a failure: the next worker
         // keeps running without us.
         const name = (e as { name?: string })?.name ?? String(e);
         console.log(`[segment ${INSTANCE}] kickSelf released (${name})`);
-      } finally {
-        clearTimeout(timer);
       }
     })());
   } catch (e) {
@@ -227,6 +234,50 @@ serve(async (req) => {
     }
     state = merged;
     return merged;
+  };
+
+  /**
+   * Merge + write ONLY while this worker still owns segment i.
+   *
+   * WHY a second variant: mergeState's guard is the status alone, so a worker
+   * whose lease expired mid-segment (a slow Gemini call) could still overwrite
+   * transcript_segments AFTER a second worker legitimately took segment i —
+   * two workers leapfrogging through the same segments. The filter below makes
+   * the CURRENT lease part of the write condition, evaluated inside Postgres:
+   *
+   *   id = meetingId
+   *   AND processing_status = 'transcribing'
+   *   AND ( transcript_segments->>'lease' IS NULL          -- already released
+   *         OR transcript_segments->'lease'->>'segment' = i )  -- still ours
+   *
+   * Returns false when the write touched no row ("lease lost"): the caller
+   * stands down and writes nothing further. A real DB error still throws.
+   */
+  const mergeStateOwned = async (
+    i: number,
+    patch: Partial<SegmentsState>,
+  ): Promise<boolean> => {
+    const merged = await mergeRead(patch);
+    const { data, error } = await supabase
+      .from("focusos_meetings")
+      .update({ transcript_segments: merged })
+      .eq("id", meetingId)
+      .eq("processing_status", "transcribing")
+      .or(
+        "transcript_segments->>lease.is.null," +
+        `transcript_segments->lease->>segment.eq.${i}`
+      )
+      .select("id");
+    if (error) throw new Error(`Owned state write failed: ${error.message}`);
+    if (!data || data.length === 0) {
+      console.warn(
+        `[segment ${INSTANCE}] ${meetingId}: lease lost on segment ${i} — ` +
+        `another worker owns it, standing down without writing`
+      );
+      return false;
+    }
+    state = merged;
+    return true;
   };
 
   /**
@@ -305,9 +356,42 @@ serve(async (req) => {
     if (!row) throw new Error("Meeting not found");
 
     const meeting = row as any;
-    const hadSegments = meeting.transcript_segments != null;
-    // A retry is only ever a re-open of a FAILED meeting.
-    const isReopen = isRetry && meeting.processing_status === "error";
+
+    /* ─── a2. Ownership ─────────────────────────────────────────────
+     * The gateway verified the JWT's SIGNATURE (verify_jwt is on by default for
+     * this function), not WHOSE it is, and every write below runs with the
+     * service role. So a caller that is not the poller or a self-kick (both of
+     * which send the service-role key) must prove it owns this row — BEFORE
+     * anything is written.                                                  */
+    const bearer = (req.headers.get("Authorization") ?? "")
+      .replace(/^Bearer\s+/i, "")
+      .trim();
+    if (bearer !== serviceKey) {
+      const anonKey = Deno.env.get("SUPABASE_ANON_KEY") || serviceKey;
+      const authClient = createClient(supabaseUrl, anonKey);
+      const { data: caller, error: callerErr } = await authClient.auth.getUser(bearer);
+      if (callerErr || !caller?.user || caller.user.id !== meeting.user_id) {
+        console.warn(
+          `[segment ${INSTANCE}] ${meetingId}: forbidden caller ` +
+          `(${callerErr?.message ?? "not the owner of this meeting"})`
+        );
+        return json({ error: "Forbidden" }, 403);
+      }
+    }
+
+    /* A retry re-opens a meeting that is 'error', AND one that still says
+     * 'transcribing' with NO live lease. The second case is the normal one: the
+     * client resets the row to transcribing / error null / attempts 0 and then
+     * invokes with retry:true, and a chain that died mid-flight leaves the row
+     * exactly there too. Only a LIVE lease means a worker is really on it.   */
+    const leaseLive = leaseIsValid(
+      (meeting.transcript_segments as SegmentsState | null)?.lease,
+      Date.now(),
+    );
+    const isReopen = isRetry && (
+      meeting.processing_status === "error" ||
+      (meeting.processing_status === "transcribing" && !leaseLive)
+    );
 
     if (meeting.processing_status !== "transcribing") {
       // A retry re-opens a FAILED meeting; anything else (done, summarizing)
@@ -321,13 +405,25 @@ serve(async (req) => {
         .update({ processing_status: "transcribing", processing_error: null })
         .eq("id", meetingId);
       console.log(`[segment ${INSTANCE}] ${meetingId}: retry re-opened an errored meeting`);
-    } else if (isRetry) {
-      // A retry on a LIVE run must NOT clear the lease: that is how two workers
+    } else if (isRetry && !isReopen) {
+      // A retry against a LIVE lease must NOT clear it: that is how two workers
       // end up on the same segment. The run in flight keeps its lease; if it is
-      // really dead, the poller resumes it once the lease expires.
-      console.log(`[segment ${INSTANCE}] ${meetingId}: retry ignored — already transcribing`);
+      // really dead, the next retry (or the poller) resumes it once it expires.
+      console.log(
+        `[segment ${INSTANCE}] ${meetingId}: retry ignored — segment ` +
+        `${(meeting.transcript_segments as SegmentsState | null)?.lease?.segment} is leased`
+      );
       armPoller(supabaseUrl, serviceKey, 0);
       return json({ busy: true });
+    } else if (isReopen) {
+      // Already 'transcribing' with a dead (or no) lease. Clear the stale cause
+      // here; attempts / lease / resumes are cleared with the state below.
+      await supabase
+        .from("focusos_meetings")
+        .update({ processing_error: null })
+        .eq("id", meetingId)
+        .eq("processing_status", "transcribing");
+      console.log(`[segment ${INSTANCE}] ${meetingId}: retry re-opened a stalled 'transcribing' meeting`);
     }
 
     // Observability only: nothing gates on this counter any more.
@@ -340,14 +436,14 @@ serve(async (req) => {
       .eq("id", meetingId);
 
     /* ─── b. Locate the recording + plan the segments ──────────── */
-    const pathMatch = String(meeting.recording_gcs_path || "").match(
-      /^gs:\/\/([^/]+)\/(.+)\/recording\./
-    );
-    if (!pathMatch) {
+    // BOTH production shapes: <folder>/recording.webm (composed) and
+    // <folder>/chunks/00000.webm (chunk_count === 1, a sub-30 s recording that
+    // focusos-process-meeting never composes). See parseRecordingPath.
+    const parsedPath = parseRecordingPath(meeting.recording_gcs_path);
+    if (!parsedPath) {
       throw new Error(`Cannot parse recording_gcs_path: ${meeting.recording_gcs_path}`);
     }
-    const bucket = pathMatch[1];
-    const folder = pathMatch[2];
+    const { bucket, folder } = parsedPath;
 
     const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
     if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured");
@@ -385,7 +481,7 @@ serve(async (req) => {
         .update({ transcript_segments: state })
         .eq("id", meetingId);
       console.log(`[segment ${INSTANCE}] ${meetingId}: ${chunkCount} chunks -> ${plans.length} segments`);
-    } else if (isReopen && hadSegments) {
+    } else if (isReopen) {
       /* ─── D. RETRY ─────────────────────────────────────────────
        * Keep the texts and the plan, drop everything that stops work:
        * the failure attempts, the poller's resume budget, and any lease
@@ -398,6 +494,30 @@ serve(async (req) => {
       console.log(
         `[segment ${INSTANCE}] ${meetingId}: retry — attempts/lease/resumes cleared, ` +
         `${countMissingSegments(state.texts, state.total)}/${state.total} segment(s) still missing`
+      );
+    }
+
+    /* ─── b2. PROVE the container before spending anything ──────────
+     * chunk 00000 must open with the EBML magic. A browser without MediaRecorder
+     * WebM support records audio/mp4, which has no EBML header and no Clusters,
+     * so every boundary search is meaningless and Gemini would be paid to
+     * transcribe a file the composer mangled. ~150-250 KB, ONCE per meeting:
+     * the proof is persisted as format:'webm' and later requests skip it. A
+     * failure here throws, and the outer catch parks the row as 'error' with
+     * this readable cause on the FIRST request instead of after a wasted call. */
+    let chunkZeroBytes: Uint8Array | null = null;
+    if (state.format !== "webm") {
+      chunkZeroBytes = await downloadObject(gcsToken, bucket, chunkObjectName(folder, 0));
+      if (!isWebm(chunkZeroBytes)) {
+        throw new Error(
+          `Recording is not WebM (first bytes ${hexHead(chunkZeroBytes)}); ` +
+          "segmented transcription supports WebM only"
+        );
+      }
+      state = await mergeState({ format: "webm" });
+      console.log(
+        `[segment ${INSTANCE}] ${meetingId}: chunk 0 is WebM ` +
+        `(${hexHead(chunkZeroBytes)}) — format flagged, later requests skip the sniff`
       );
     }
 
@@ -416,7 +536,7 @@ serve(async (req) => {
     }
 
     /* ─── d. Transcribe ONE segment ────────────────────────────── */
-    const runSegment = async (i: number) => {
+    const runSegment = async (i: number): Promise<boolean> => {
       const total = state!.total;
       // The lease on segment i is ALREADY held: the caller took it with
       // takeLease(i) (one conditional UPDATE), which is the only safe way to
@@ -432,11 +552,11 @@ serve(async (req) => {
       if (i > 0) {
         const initObject = initObjectName(folder);
         if (!state!.initReady) {
-          const chunkZero = await downloadObject(gcsToken, bucket, chunkObjectName(folder, 0));
-          // FAIL FAST on a non-WebM recording: browsers without MediaRecorder
-          // WebM support fall back to audio/mp4, which has no EBML header and no
-          // Clusters at all, so every boundary search below is meaningless. A
-          // readable cause on the card beats "WebM init boundary not found".
+          // Reuse the bytes step b2 already downloaded in THIS request; a
+          // request that skipped the sniff (format already flagged) fetches now.
+          const chunkZero = chunkZeroBytes ??
+            await downloadObject(gcsToken, bucket, chunkObjectName(folder, 0));
+          // Belt and braces: b2 (or an earlier request) already proved this.
           if (!isWebm(chunkZero)) {
             throw new Error(
               `Recording is not WebM (first bytes ${hexHead(chunkZero)}); ` +
@@ -507,13 +627,17 @@ serve(async (req) => {
       console.log(`[segment ${INSTANCE}] ${meetingId}: segment ${i + 1}/${total} -> ${text.length} chars`);
 
       // Persist BEFORE anything else can go wrong: this segment is now paid for.
-      await mergeState({ texts: { [String(i)]: text }, lease: null });
+      // ONE owned write does both halves — store the text and release the lease
+      // — so a worker whose lease expired mid-call cannot overwrite the state of
+      // the worker that legitimately took segment i.
+      const kept = await mergeStateOwned(i, { texts: { [String(i)]: text }, lease: null });
 
       try {
         await deleteGeminiFile(GEMINI_API_KEY, fileUri);
       } catch (e) {
         console.warn(`[segment ${INSTANCE}] Gemini file delete failed (non-critical):`, e);
       }
+      return kept;
     };
 
     /* ─── e. Drop init.webm + segments/ once the transcript is safe ─ */
@@ -573,19 +697,40 @@ serve(async (req) => {
           return json({ processed, busy: true });
         }
         segmentIndex = next;
-        await runSegment(next);
-        processed.push(next);
+        const kept = await runSegment(next);
         segmentIndex = null;
+        if (!kept) {
+          // The lease expired under us and another worker owns segment `next`.
+          // Write NOTHING more (the owner's state is authoritative) and let it
+          // carry the chain.
+          return json({ processed, leaseLost: next });
+        }
+        processed.push(next);
       }
 
       const remaining = countMissingSegments(state.texts, state.total);
       if (remaining > 0) {
-        // kickSelf re-arms the watchdog itself.
+        // Hand over only; the watchdog was armed once, above, for this request
+        // (and the next worker arms it once for itself).
         kickSelf(supabaseUrl, serviceKey, meetingId);
         return json({ processed, remaining });
       }
 
       /* ─── f. FINALIZE ────────────────────────────────────────── */
+      // A segment that started at the end of the budget can run for ~4 more
+      // minutes (upload 60 s + ACTIVE 60 s + generate 120 s), which leaves no
+      // room for the summary call. Hand over: the next worker sees zero missing
+      // segments and finalizes immediately with a full wall clock.
+      const spentMs = Date.now() - requestStart;
+      if (spentMs > WALL_CLOCK_MS - FINALIZE_RESERVE_MS) {
+        console.log(
+          `[segment ${INSTANCE}] ${meetingId}: ${Math.round(spentMs / 1000)}s spent — ` +
+          `handing the finalize to a fresh worker`
+        );
+        kickSelf(supabaseUrl, serviceKey, meetingId);
+        return json({ processed, handover: "finalize", spentMs });
+      }
+
       const transcript = joinTranscript(state.texts, state.total, state.segmentChunks);
       if (!transcript.trim()) throw new Error("Joined transcript is empty");
 
@@ -652,7 +797,25 @@ serve(async (req) => {
       console.error(`[segment ${INSTANCE}] ${meetingId}: ${label} failed —`, message);
 
       const attemptCount = ((state?.attempts ?? {})[key] ?? 0) + 1;
-      await mergeState({ attempts: { [key]: attemptCount }, lease: null });
+      try {
+        if (segmentIndex === null) {
+          // Finalize failure: no lease is held (the last segment's write
+          // released it), so do not touch the lease key at all.
+          await mergeState({ attempts: { [key]: attemptCount } });
+        } else {
+          // Same ownership condition as the success path: release ONLY our own
+          // lease, never one a second worker has since taken.
+          await mergeStateOwned(segmentIndex, {
+            attempts: { [key]: attemptCount },
+            lease: null,
+          });
+        }
+      } catch (stateErr) {
+        console.warn(
+          `[segment ${INSTANCE}] ${meetingId}: could not record the failure state —`,
+          scrubSecrets(stateErr, [serviceKey, Deno.env.get("GEMINI_API_KEY")])
+        );
+      }
       await supabase
         .from("focusos_meetings")
         .update({ processing_error: `${label}: ${message}` })
@@ -680,15 +843,22 @@ serve(async (req) => {
     console.error(`[segment ${INSTANCE}] handler error:`, message);
     if (meetingId) {
       try {
+        // FAIL the row, do not leave it spinning. Everything that reaches this
+        // catch is DETERMINISTIC — no chunks, an unparseable recording path, a
+        // non-WebM container, a missing env var — so 12 poller resumes (~40 min)
+        // would repeat the same failure before the card ever showed "Failed".
+        // The status guard means a row another worker finished is left alone,
+        // and a retry re-opens this one (isReopen above).
         await supabase
           .from("focusos_meetings")
-          .update({ processing_error: message })
-          .eq("id", meetingId);
+          .update({ processing_status: "error", processing_error: message })
+          .eq("id", meetingId)
+          .eq("processing_status", "transcribing");
       } catch (dbErr) {
         console.error(`[segment ${INSTANCE}] failed to record handler error:`, dbErr);
       }
-      // Whatever just went wrong, the row is still 'transcribing': let the
-      // watchdog decide whether to resume it or fail it for good.
+      // Best effort: if the write above touched no row (the meeting moved on
+      // under us), the watchdog is still the thing that rescues it.
       armPoller(supabaseUrl, serviceKey, 0);
     }
     return json({ error: message }, 400);
