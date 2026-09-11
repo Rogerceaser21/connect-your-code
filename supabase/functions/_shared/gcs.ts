@@ -13,7 +13,11 @@ export interface ServiceAccount {
   token_uri: string;
 }
 
-/** Every GCS leg is bounded so no segment can outlive its lease on a hung call. */
+/**
+ * Every GCS leg is bounded so a hung call can never hold a worker (and its
+ * request) open indefinitely. This bounds each leg, not the whole segment:
+ * ownership of the row is what protects state when a lease expires.
+ */
 export const GCS_TIMEOUT_MS = 60_000;
 
 export async function getGcsAccessToken(sa: ServiceAccount): Promise<string> {

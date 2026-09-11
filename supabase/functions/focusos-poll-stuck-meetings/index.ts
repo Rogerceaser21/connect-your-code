@@ -87,8 +87,12 @@ serve(async (req) => {
               gemini_file_uri: null,
             })
             .eq("id", row.id)
-            // Guarded: the row must still be where we read it (no worker moved it).
-            .eq("processing_status", row.processing_status);
+            // Guarded: the row must still be exactly where we read it. The status
+            // check alone is not enough (a worker can plan the row under an
+            // unchanged 'transcribing'), so the row's updated_at must also be
+            // older than the cutoff we selected with.
+            .eq("processing_status", row.processing_status)
+            .lt("updated_at", cutoff);
           continue;
         }
 
