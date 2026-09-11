@@ -1,5 +1,44 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  composeObjects,
+  downloadObject,
+  getGcsAccessToken,
+  listChunkCount,
+  uploadToGcs,
+  type ServiceAccount,
+} from "../_shared/gcs.ts";
+import {
+  deleteGeminiFile,
+  generateSummary,
+  transcribeSegment,
+  uploadToGeminiFileAPI,
+  waitForGeminiFileActive,
+} from "../_shared/gemini.ts";
+import {
+  chunkObjectName,
+  findInitBoundary,
+  firstMissingSegment,
+  formatHMS,
+  joinTranscript,
+  leaseIsValid,
+  planSegments,
+  segmentStartSeconds,
+  type SegmentsState,
+} from "../_shared/segments.ts";
+
+/**
+ * SEGMENT WORKER.
+ *
+ * One request = ONE ~10 minute segment of one meeting, transcribed
+ * SYNCHRONOUSLY and well inside the edge worker's budget, then the worker
+ * hands the baton to a fresh invocation of itself. Nothing heavy runs in the
+ * background, so a worker being recycled costs at most the current segment
+ * (the next request re-does it), never the whole meeting.
+ *
+ * Body: { meetingId }. Every other field is ignored (old clients still send
+ * geminiFileUri / gcsBucket / … — harmless).
+ */
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -7,483 +46,330 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type",
 };
 
-/* ─── GCS helpers ───────────────────────────────────────────────── */
+const SEGMENT_CHUNKS = 20;      // 20 x 30 s chunks = 10 min of audio per Gemini call
+const LEASE_MS = 180_000;       // a worker owns its segment for 3 min
+const FILE_ACTIVE_CAP_MS = 60_000;
+const MAX_SEGMENT_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 5_000; // x attempt number, retry path only
 
-interface ServiceAccount {
-  client_email: string;
-  private_key: string;
-  token_uri: string;
-}
+// @ts-ignore — EdgeRuntime is provided by the Supabase edge runtime
+declare const EdgeRuntime: { waitUntil: (p: Promise<unknown>) => void };
 
-async function getGcsAccessToken(sa: ServiceAccount): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
-  const claim = btoa(
-    JSON.stringify({
-      iss: sa.client_email,
-      scope: "https://www.googleapis.com/auth/devstorage.read_write",
-      aud: sa.token_uri,
-      exp: now + 3600,
-      iat: now,
-    })
-  );
-  const unsignedToken = `${header}.${claim}`;
-
-  const pemBody = sa.private_key
-    .replace(/-----BEGIN PRIVATE KEY-----/, "")
-    .replace(/-----END PRIVATE KEY-----/, "")
-    .replace(/\n/g, "");
-  const keyData = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
-  const cryptoKey = await crypto.subtle.importKey(
-    "pkcs8",
-    keyData,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-
-  const sig = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    cryptoKey,
-    new TextEncoder().encode(unsignedToken)
-  );
-  const signature = btoa(String.fromCharCode(...new Uint8Array(sig)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-  const jwt = `${unsignedToken}.${signature}`;
-
-  const resp = await fetch(sa.token_uri, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
-  const { access_token } = await resp.json();
-  return access_token;
 }
-
-async function uploadToGcs(
-  token: string,
-  bucket: string,
-  path: string,
-  data: Uint8Array | string,
-  contentType: string
-): Promise<string> {
-  const encodedPath = encodeURIComponent(path);
-  const body = typeof data === "string" ? new TextEncoder().encode(data) : data;
-  const resp = await fetch(
-    `https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o?uploadType=media&name=${encodedPath}`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": contentType,
-      },
-      body,
-    }
-  );
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`GCS upload failed: ${err}`);
-  }
-  const result = await resp.json();
-  return `gs://${bucket}/${result.name}`;
-}
-
-/* ─── Summary helpers ───────────────────────────────────────────── */
-
-function stripMarkdown(text: string): string {
-  return text
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/\*([^*]+)\*/g, "$1")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/`([^`]+)`/g, "$1");
-}
-
-function getSummaryPrompt(transcript: string, detailLevel: string, durationSeconds: number): string {
-  const durationMin = Math.round(durationSeconds / 60);
-  const levelConfig: Record<string, { maxSections: number; bulletGuidance: string; overviewGuidance: string; description: string }> = {
-    concise: {
-      maxSections: durationMin < 5 ? 2 : durationMin < 30 ? 3 : 5,
-      bulletGuidance: "1-3 SHORT bullets per section. Only decisions and action items.",
-      overviewGuidance: "1-2 sentences. What happened and what is next.",
-      description: "Only key decisions, action items, and major takeaways. Ruthlessly cut fluff.",
-    },
-    standard: {
-      maxSections: durationMin < 5 ? 3 : durationMin < 30 ? 5 : 6,
-      bulletGuidance: "2-5 bullets per section. Include key context.",
-      overviewGuidance: "2-4 sentences. Key topics, decisions, and outcomes.",
-      description: "Main discussion points and conclusions with supporting context.",
-    },
-    detailed: {
-      maxSections: durationMin < 5 ? 4 : durationMin < 30 ? 6 : 8,
-      bulletGuidance: "Thorough but never redundant.",
-      overviewGuidance: "3-6 sentences. Comprehensive executive summary.",
-      description: "Thorough capture including nuances, disagreements, and supporting arguments.",
-    },
-  };
-  const config = levelConfig[detailLevel] || levelConfig.concise;
-
-  return `Analyze this meeting transcript and provide a structured summary.
-Detail level: ${detailLevel} — ${config.description}
-
-CRITICAL RULES:
-1. Think like an executive assistant. Extract ONLY what matters.
-2. Do NOT repeat information.
-3. Each bullet must convey a UNIQUE piece of information.
-4. Omit filler, greetings, small talk entirely.
-5. Do NOT use any markdown formatting. Plain text only.
-6. Headings should be short descriptive labels (3-6 words).
-7. Maximum ${config.maxSections} sections. ${config.bulletGuidance}
-8. Overview: ${config.overviewGuidance}
-9. Return ONLY valid JSON.
-
-Return JSON: { "overview": "string", "outline": [{ "heading": "string", "points": ["string"] }] }
-
-Transcript:
-${transcript}`;
-}
-
-function parseGeminiSummaryResponse(rawText: string): string {
-  try {
-    const parsed = JSON.parse(rawText);
-    if (parsed.overview) {
-      parsed.overview = stripMarkdown(parsed.overview);
-      if (parsed.outline) {
-        parsed.outline = parsed.outline.map((s: any) => ({
-          heading: stripMarkdown(s.heading || ""),
-          points: (s.points || []).map((p: string) => stripMarkdown(p)),
-        }));
-      }
-      return JSON.stringify(parsed);
-    }
-    return JSON.stringify({ overview: stripMarkdown(rawText), outline: [] });
-  } catch {
-    let cleaned = rawText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-    const jsonStart = cleaned.search(/[\{\[]/);
-    const jsonEnd = cleaned.lastIndexOf("}");
-    if (jsonStart !== -1 && jsonEnd !== -1) {
-      cleaned = cleaned.substring(jsonStart, jsonEnd + 1)
-        .replace(/,\s*}/g, "}").replace(/,\s*]/g, "]").replace(/[\x00-\x1F\x7F]/g, "");
-      try {
-        const parsed = JSON.parse(cleaned);
-        parsed.overview = stripMarkdown(parsed.overview || "");
-        if (parsed.outline) {
-          parsed.outline = parsed.outline.map((s: any) => ({
-            heading: stripMarkdown(s.heading || ""),
-            points: (s.points || []).map((p: string) => stripMarkdown(p)),
-          }));
-        }
-        return JSON.stringify(parsed);
-      } catch {
-        return JSON.stringify({ overview: stripMarkdown(rawText), outline: [] });
-      }
-    }
-    return JSON.stringify({ overview: stripMarkdown(rawText), outline: [] });
-  }
-}
-
-async function generateSummary(apiKey: string, transcript: string, detailLevel: string, durationSeconds: number): Promise<string> {
-  const prompt = getSummaryPrompt(transcript, detailLevel, durationSeconds);
-  const resp = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json" },
-      }),
-    }
-  );
-  if (!resp.ok) {
-    console.error("Summary generation failed:", await resp.text());
-    return JSON.stringify({ overview: "Summary generation failed.", outline: [] });
-  }
-  const data = await resp.json();
-  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  if (!rawText) return JSON.stringify({ overview: "No summary available.", outline: [] });
-  return parseGeminiSummaryResponse(rawText);
-}
-
-/* ─── Main handler ──────────────────────────────────────────────── */
 
 /**
- * Fire-and-forget invocation of the poller. We do NOT await the response —
- * the poller chain runs independently in the background.
+ * Hand the baton to a fresh worker (same self-reschedule pattern the poller
+ * uses). Fire-and-forget: the caller has already persisted its progress.
+ * delayMs is used only on the retry path, so a transient Gemini error does not
+ * burn all three attempts within a couple of seconds.
  */
-function armPoller(supabaseUrl: string, serviceKey: string, chainCount = 0) {
+function scheduleNext(
+  supabaseUrl: string,
+  serviceKey: string,
+  meetingId: string,
+  delayMs = 0
+) {
   try {
-    fetch(`${supabaseUrl}/functions/v1/focusos-poll-stuck-meetings`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${serviceKey}`,
-        apikey: serviceKey,
-      },
-      body: JSON.stringify({ chainCount }),
-    }).catch((e) => console.warn("armPoller fetch error:", e?.message));
+    EdgeRuntime.waitUntil((async () => {
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+      try {
+        await fetch(`${supabaseUrl}/functions/v1/focusos-transcribe-meeting`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${serviceKey}`,
+            apikey: serviceKey,
+          },
+          body: JSON.stringify({ meetingId }),
+        });
+      } catch (e) {
+        console.warn("[segment] self-invoke error:", e);
+      }
+    })());
   } catch (e) {
-    console.warn("armPoller threw:", e);
+    console.warn("[segment] scheduleNext threw:", e);
   }
 }
-
-// @ts-ignore — EdgeRuntime is provided by Supabase edge runtime
-declare const EdgeRuntime: { waitUntil: (p: Promise<unknown>) => void };
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // Use service role key so we can update the meeting regardless of RLS
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const supabase = createClient(supabaseUrl, supabaseServiceKey);
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const supabase = createClient(supabaseUrl, serviceKey);
 
-  let meetingId: string | undefined;
+  let meetingId = "";
+  let segmentIndex: number | null = null;
+  let state: SegmentsState | null = null;
+
+  /** Re-read transcript_segments and merge, so a concurrent write is not clobbered. */
+  const mergeState = async (patch: Partial<SegmentsState>): Promise<SegmentsState> => {
+    const { data: fresh } = await supabase
+      .from("focusos_meetings")
+      .select("transcript_segments")
+      .eq("id", meetingId)
+      .maybeSingle();
+    const current = ((fresh as any)?.transcript_segments ?? state) as SegmentsState;
+    const merged: SegmentsState = {
+      ...current,
+      ...patch,
+      texts: { ...(current?.texts ?? {}), ...(patch.texts ?? {}) },
+      attempts: { ...(current?.attempts ?? {}), ...(patch.attempts ?? {}) },
+    };
+    await supabase
+      .from("focusos_meetings")
+      .update({ transcript_segments: merged })
+      .eq("id", meetingId);
+    state = merged;
+    return merged;
+  };
 
   try {
-    const body = await req.json();
-    meetingId = body.meetingId;
-    const geminiFileUri: string = body.geminiFileUri;
-    const mimeType: string = body.mimeType || "audio/webm";
-    const participantNames: string[] = body.participantNames || [];
-    const durationSeconds: number = body.durationSeconds || 0;
-    const gcsBucket: string = body.gcsBucket;
-    const gcsFolder: string = body.gcsFolder;
+    /* ─── a. Read the row ──────────────────────────────────────── */
+    const body = await req.json().catch(() => ({}));
+    meetingId = (body as any)?.meetingId ?? "";
+    if (!meetingId) return json({ error: "Missing meetingId" }, 400);
 
-    if (!meetingId || !geminiFileUri) throw new Error("Missing meetingId or geminiFileUri");
-
-    const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
-    if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured");
-
-    // Mark as started + increment attempts atomically-ish
-    const { data: currentRow } = await supabase
+    const { data: row, error: rowErr } = await supabase
       .from("focusos_meetings")
-      .select("gemini_transcribe_attempts")
+      .select(
+        "id, user_id, title, participants, duration_seconds, recording_gcs_path, processing_status, transcript_segments, gemini_transcribe_attempts"
+      )
       .eq("id", meetingId)
-      .single();
-    const newAttempts = ((currentRow as any)?.gemini_transcribe_attempts ?? 0) + 1;
+      .maybeSingle();
 
+    if (rowErr) return json({ error: rowErr.message }, 400);
+    if (!row) return json({ error: "Meeting not found" }, 400);
+
+    const meeting = row as any;
+    if (meeting.processing_status !== "transcribing") {
+      console.log(`[segment] ${meetingId} is '${meeting.processing_status}' — nothing to do`);
+      return json({ skipped: meeting.processing_status });
+    }
+
+    // Observability only: nothing gates on this counter any more.
     await supabase
       .from("focusos_meetings")
       .update({
-        processing_status: "transcribing",
-        processing_error: null,
+        gemini_transcribe_attempts: (meeting.gemini_transcribe_attempts ?? 0) + 1,
         gemini_transcribe_started_at: new Date().toISOString(),
-        gemini_transcribe_attempts: newAttempts,
       })
       .eq("id", meetingId);
 
-    // Run the heavy work in the background. Return 202 to caller immediately
-    // so the HTTP request doesn't block on Gemini transcription (which can
-    // take several minutes for long meetings).
-    const work = doTranscription({
-      supabase,
-      meetingId: meetingId!,
-      geminiFileUri,
-      mimeType,
-      participantNames,
-      durationSeconds,
-      gcsBucket,
-      gcsFolder,
-      GEMINI_API_KEY,
-    }).then(() => {
-      // Arm poller after work completes (cleans up any other stuck rows + finishes summarization if needed)
-      armPoller(supabaseUrl, supabaseServiceKey, 0);
-    }).catch(async (err) => {
-      console.error("Background transcription error:", err);
-      try {
-        await supabase
+    /* ─── b. Locate the recording + plan the segments ──────────── */
+    const pathMatch = String(meeting.recording_gcs_path || "").match(
+      /^gs:\/\/([^/]+)\/(.+)\/recording\./
+    );
+    if (!pathMatch) {
+      return json({ error: `Cannot parse recording_gcs_path: ${meeting.recording_gcs_path}` }, 400);
+    }
+    const bucket = pathMatch[1];
+    const folder = pathMatch[2];
+
+    const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
+    if (!GEMINI_API_KEY) return json({ error: "GEMINI_API_KEY not configured" }, 400);
+    const gcsKeyJson = Deno.env.get("GCS_SERVICE_ACCOUNT_JSON");
+    if (!gcsKeyJson) return json({ error: "GCS_SERVICE_ACCOUNT_JSON not configured" }, 400);
+    const sa: ServiceAccount = JSON.parse(gcsKeyJson);
+    const gcsToken = await getGcsAccessToken(sa);
+
+    const mimeType = (meeting as any).mime_type || "audio/webm";
+
+    state = (meeting.transcript_segments ?? null) as SegmentsState | null;
+    if (!state || typeof state.total !== "number") {
+      const chunkCount = await listChunkCount(gcsToken, bucket, folder);
+      if (chunkCount === 0) return json({ error: "No chunks found" }, 400);
+      const plans = planSegments(chunkCount, SEGMENT_CHUNKS);
+      state = {
+        total: plans.length,
+        chunkCount,
+        segmentChunks: SEGMENT_CHUNKS,
+        initReady: false,
+        texts: {},
+        attempts: {},
+        // preserve a resume count the poller may already have written
+        resumes: (meeting.transcript_segments as any)?.resumes ?? 0,
+        lease: null,
+      };
+      await supabase
+        .from("focusos_meetings")
+        .update({ transcript_segments: state })
+        .eq("id", meetingId);
+      console.log(`[segment] ${meetingId}: ${chunkCount} chunks -> ${plans.length} segments`);
+    }
+
+    /* ─── c. Lease check + pick the next hole ──────────────────── */
+    if (leaseIsValid(state.lease, Date.now())) {
+      console.log(`[segment] ${meetingId}: segment ${state.lease?.segment} already leased`);
+      return json({ busy: true });
+    }
+
+    segmentIndex = firstMissingSegment(state.texts, state.total);
+
+    try {
+      if (segmentIndex === null) {
+        /* ─── e. FINALIZE ──────────────────────────────────────── */
+        const transcript = joinTranscript(state.texts, state.total, state.segmentChunks);
+        if (!transcript.trim()) throw new Error("Joined transcript is empty");
+
+        const transcriptGcsPath = await uploadToGcs(
+          gcsToken,
+          bucket,
+          `${folder}/transcript.json`,
+          JSON.stringify({ transcript, timestamp: new Date().toISOString() }),
+          "application/json"
+        );
+
+        const summary = await generateSummary(
+          GEMINI_API_KEY,
+          transcript,
+          "concise",
+          meeting.duration_seconds || 0
+        );
+
+        // Drop the per-segment texts once the transcript is durable in GCS:
+        // the meetings list prefetch does select('*'), so an 80 KB transcript
+        // left in this jsonb would ride along on every app load.
+        const finalState: SegmentsState = {
+          ...state,
+          texts: {},
+          lease: null,
+        };
+
+        const { error: updateError } = await supabase
           .from("focusos_meetings")
           .update({
-            // Don't mark failed yet — let the poller retry up to 3 times
-            processing_error: err instanceof Error ? err.message : String(err),
+            summary,
+            transcript_gcs_path: transcriptGcsPath,
+            processing_status: "done",
+            processing_error: null,
+            gemini_file_uri: null,
+            transcription_text: null,
+            transcript_segments: finalState,
           })
-          .eq("id", meetingId!);
-      } catch (dbErr) {
-        console.error("Failed to record background error:", dbErr);
+          .eq("id", meetingId);
+        if (updateError) throw new Error(`Failed to update meeting: ${updateError.message}`);
+
+        console.log(`[segment] ${meetingId}: finalized ${state.total} segments`);
+        return json({ done: true, total: state.total });
       }
-      // Arm poller so it can retry
-      armPoller(supabaseUrl, supabaseServiceKey, 0);
-    });
 
-    EdgeRuntime.waitUntil(work);
-    // Also arm the poller immediately so it monitors progress in parallel
-    armPoller(supabaseUrl, supabaseServiceKey, 0);
+      /* ─── d. Transcribe ONE segment ──────────────────────────── */
+      const i = segmentIndex;
+      const total = state.total;
+      await mergeState({
+        lease: { segment: i, until: new Date(Date.now() + LEASE_MS).toISOString() },
+      });
 
-    return new Response(
-      JSON.stringify({ success: true, accepted: true, meetingId, attempt: newAttempts }),
-      { status: 202, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+      // Init segment: the EBML header of chunk 00000, which every later chunk
+      // lacks. Prepended to each composed segment so it decodes on its own.
+      const initObject = `${folder}/init.webm`;
+      if (!state.initReady) {
+        const chunkZero = await downloadObject(gcsToken, bucket, chunkObjectName(folder, 0));
+        const boundary = findInitBoundary(chunkZero);
+        await uploadToGcs(gcsToken, bucket, initObject, chunkZero.slice(0, boundary), mimeType);
+        console.log(`[segment] ${meetingId}: init.webm written (${boundary} bytes)`);
+        await mergeState({ initReady: true });
+      }
+
+      const plan = planSegments(state.chunkCount, state.segmentChunks)[i];
+      if (!plan) throw new Error(`No plan for segment ${i} of ${total}`);
+
+      const sources = [initObject];
+      for (let k = plan.firstChunk; k <= plan.lastChunk; k++) {
+        sources.push(chunkObjectName(folder, k));
+      }
+      const segmentObject = `${folder}/segments/${String(i).padStart(2, "0")}.webm`;
+      await composeObjects(gcsToken, bucket, sources, segmentObject, mimeType);
+      console.log(
+        `[segment] ${meetingId}: composed segment ${i + 1}/${total} (chunks ${plan.firstChunk}-${plan.lastChunk})`
+      );
+
+      const fileUri = await uploadToGeminiFileAPI(
+        GEMINI_API_KEY,
+        gcsToken,
+        bucket,
+        segmentObject,
+        mimeType,
+        `${meeting.title || "meeting"} part ${i + 1}`
+      );
+      await waitForGeminiFileActive(GEMINI_API_KEY, fileUri, FILE_ACTIVE_CAP_MS);
+
+      const participantNames = (meeting.participants || [])
+        .filter((p: any) => p?.name?.trim())
+        .map((p: any) => p.name.trim());
+      const participantsLine = participantNames.length > 0
+        ? ` The participants are: ${participantNames.join(", ")}. Label each speaker by their name where possible.`
+        : " Include speaker diarization where possible (label speakers as Speaker 1, Speaker 2, etc.).";
+      const previousTail = i > 0 ? (state.texts[String(i - 1)] || "").slice(-600) : "";
+      const continuityLine = previousTail
+        ? ` Keep speaker labels consistent with the end of the previous part, which was: ${previousTail}`
+        : "";
+
+      const prompt = `This is part ${i + 1} of ${total} of one meeting recording. This part starts at ${
+        formatHMS(segmentStartSeconds(i, state.segmentChunks))
+      } of the meeting.${participantsLine} Transcribe it as a clean transcript with speaker labels. Do not include timestamps.${continuityLine}`;
+
+      const text = await transcribeSegment(GEMINI_API_KEY, fileUri, mimeType, prompt);
+      console.log(`[segment] ${meetingId}: segment ${i + 1}/${total} -> ${text.length} chars`);
+
+      await mergeState({ texts: { [String(i)]: text }, initReady: true, lease: null });
+
+      try {
+        await deleteGeminiFile(GEMINI_API_KEY, fileUri);
+      } catch (e) {
+        console.warn("[segment] Gemini file delete failed (non-critical):", e);
+      }
+
+      scheduleNext(supabaseUrl, serviceKey, meetingId);
+      return json({ segment: i, total });
+    } catch (workErr) {
+      /* ─── f. Segment / finalize failure ────────────────────── */
+      const message = workErr instanceof Error ? workErr.message : String(workErr);
+      const key = segmentIndex === null ? "final" : String(segmentIndex);
+      const label = segmentIndex === null
+        ? "Finalize"
+        : `Segment ${segmentIndex + 1}/${state?.total ?? 0}`;
+      console.error(`[segment] ${meetingId}: ${label} failed —`, message);
+
+      const attemptCount = ((state?.attempts ?? {})[key] ?? 0) + 1;
+      await mergeState({ attempts: { [key]: attemptCount }, lease: null });
+      await supabase
+        .from("focusos_meetings")
+        .update({ processing_error: `${label}: ${message}` })
+        .eq("id", meetingId);
+
+      if (attemptCount < MAX_SEGMENT_ATTEMPTS) {
+        scheduleNext(supabaseUrl, serviceKey, meetingId, attemptCount * RETRY_BACKOFF_MS);
+        return json({ retry: segmentIndex ?? "final", attempt: attemptCount });
+      }
+
+      await supabase
+        .from("focusos_meetings")
+        .update({ processing_status: "error" })
+        .eq("id", meetingId);
+      return json({ failed: segmentIndex ?? "final", attempt: attemptCount });
+    }
   } catch (error) {
-    console.error("Transcribe-meeting handler error:", error);
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("[segment] handler error:", message);
     if (meetingId) {
       try {
         await supabase
           .from("focusos_meetings")
-          .update({
-            processing_error: error instanceof Error ? error.message : "Unknown error",
-          })
+          .update({ processing_error: message })
           .eq("id", meetingId);
       } catch (dbErr) {
-        console.error("Failed to update meeting error status:", dbErr);
+        console.error("[segment] failed to record handler error:", dbErr);
       }
     }
-    return new Response(
-      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    return json({ error: message }, 400);
   }
 });
-
-/* ─── Background transcription task ─────────────────────────────── */
-
-interface DoTranscriptionArgs {
-  supabase: ReturnType<typeof createClient>;
-  meetingId: string;
-  geminiFileUri: string;
-  mimeType: string;
-  participantNames: string[];
-  durationSeconds: number;
-  gcsBucket: string;
-  gcsFolder: string;
-  GEMINI_API_KEY: string;
-}
-
-async function doTranscription(args: DoTranscriptionArgs) {
-  const {
-    supabase, meetingId, geminiFileUri, mimeType, participantNames,
-    durationSeconds, gcsBucket, gcsFolder, GEMINI_API_KEY,
-  } = args;
-
-    // Step 1: Poll Gemini file until ACTIVE
-    console.log(`Polling Gemini file status for: ${geminiFileUri}`);
-    const fileNameMatch = geminiFileUri.match(/files\/([^\/]+)$/);
-    const fileName = fileNameMatch ? fileNameMatch[1] : null;
-    if (!fileName) throw new Error(`Cannot parse file name from URI: ${geminiFileUri}`);
-
-    let fileState = "PROCESSING";
-    let pollAttempts = 0;
-    const maxPollAttempts = 60; // 5 minutes max (5s intervals)
-
-    while (fileState === "PROCESSING" && pollAttempts < maxPollAttempts) {
-      const statusResp = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${GEMINI_API_KEY}`
-      );
-      if (!statusResp.ok) {
-        const err = await statusResp.text();
-        throw new Error(`Failed to check file status: ${err}`);
-      }
-      const statusData = await statusResp.json();
-      fileState = statusData.state;
-      console.log(`File state: ${fileState} (attempt ${pollAttempts + 1})`);
-
-      if (fileState === "ACTIVE") break;
-      if (fileState === "FAILED") throw new Error("Gemini file processing failed");
-
-      pollAttempts++;
-      await new Promise((r) => setTimeout(r, 5000));
-    }
-
-    if (fileState !== "ACTIVE") throw new Error("Gemini file did not become ACTIVE in time");
-
-    // Step 2: Transcribe using file URI
-    console.log("Transcribing with Gemini using file URI...");
-
-    const transcribeBody = {
-      contents: [
-        {
-          parts: [
-            {
-              fileData: {
-                mimeType,
-                fileUri: geminiFileUri,
-              },
-            },
-            {
-              text: `Transcribe this audio recording of a meeting.${
-                participantNames.length > 0
-                  ? ` The participants are: ${participantNames.join(", ")}. Label each speaker by their name where possible.`
-                  : " Include speaker diarization where possible (label speakers as Speaker 1, Speaker 2, etc.)."
-              }
-              
-Format the output as a clean transcript with speaker labels and timestamps where detectable. Be thorough and accurate.`,
-            },
-          ],
-        },
-      ],
-    };
-
-    // Use non-streaming call — edge function timeout is the constraint,
-    // but Gemini processes the file server-side and returns the full result
-    const transcribeResp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(transcribeBody),
-      }
-    );
-
-    if (!transcribeResp.ok) {
-      const errText = await transcribeResp.text();
-      console.error("Gemini transcription error:", errText);
-      throw new Error(`Transcription failed: ${errText}`);
-    }
-
-    const transcribeData = await transcribeResp.json();
-    const transcript = transcribeData.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    if (!transcript) throw new Error("Empty transcript returned from Gemini");
-    console.log("Transcript length:", transcript.length);
-
-    // Persist raw transcript immediately so the poller can finish summarization
-    // even if THIS background task gets killed before completing the next steps.
-    await supabase
-      .from("focusos_meetings")
-      .update({ transcription_text: transcript, processing_status: "summarizing" })
-      .eq("id", meetingId);
-
-    // Step 3: Upload transcript to GCS
-    const gcsKeyJson = Deno.env.get("GCS_SERVICE_ACCOUNT_JSON");
-    if (!gcsKeyJson) throw new Error("GCS_SERVICE_ACCOUNT_JSON not configured");
-    const sa: ServiceAccount = JSON.parse(gcsKeyJson);
-    const gcsToken = await getGcsAccessToken(sa);
-
-    const transcriptPath = `${gcsFolder}/transcript.json`;
-    const transcriptJson = JSON.stringify({ transcript, timestamp: new Date().toISOString() });
-    const transcriptGcsPath = await uploadToGcs(gcsToken, gcsBucket, transcriptPath, transcriptJson, "application/json");
-
-    // Step 4: Summarize
-    console.log("Generating summary...");
-    const summary = await generateSummary(GEMINI_API_KEY, transcript, "concise", durationSeconds);
-    console.log("Summary generated");
-
-    // Step 5: Save everything to meeting
-    const { error: updateError } = await supabase
-      .from("focusos_meetings")
-      .update({
-        summary,
-        transcript_gcs_path: transcriptGcsPath,
-        processing_status: "done",
-        processing_error: null,
-        gemini_file_uri: null, // Clear it
-        transcription_text: null, // Clear staged transcript
-      })
-      .eq("id", meetingId);
-
-    if (updateError) throw new Error(`Failed to update meeting: ${updateError.message}`);
-    console.log("Meeting fully processed:", meetingId);
-
-    // Step 6: Cleanup - delete file from Gemini
-    try {
-      await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${GEMINI_API_KEY}`,
-        { method: "DELETE" }
-      );
-      console.log("Gemini file deleted");
-    } catch (e) {
-      console.warn("Failed to delete Gemini file (non-critical):", e);
-    }
-}

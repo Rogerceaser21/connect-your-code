@@ -246,7 +246,7 @@ mcp.tool("list_meetings", {
     const userId = getUserId(ctx);
     const { data, error } = await admin
       .from("focusos_meetings")
-      .select("id, title, status, created_at, summary")
+      .select("id, title, processing_status, processing_error, duration_seconds, created_at, summary")
       .eq("user_id", userId)
       .order("created_at", { ascending: false })
       .limit(Math.min(Math.max(args?.limit ?? 20, 1), 100));
