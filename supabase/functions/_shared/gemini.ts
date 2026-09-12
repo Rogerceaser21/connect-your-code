@@ -9,20 +9,22 @@
  */
 
 import { extractTranscriptText } from "./segments.ts";
+import { GENERATE_TIMEOUT_MS, UPLOAD_TIMEOUT_MS } from "./timing.ts";
 
 const GEMINI_MODEL = "gemini-2.5-flash";
 
 /**
  * Every Gemini call is time-boxed. WHY: a hung fetch inside a segment has no
  * other ceiling — the lease expires, a second worker takes the segment, and the
- * first one is still holding the socket when it writes. These caps are what the
- * worker's LEASE_MS is sized against (compose + upload 60 s + ACTIVE 60 s +
- * generate 120 s).
+ * first one is still holding the socket when it writes. UPLOAD_TIMEOUT_MS (30 s)
+ * and GENERATE_TIMEOUT_MS (60 s, used by BOTH the transcription and the summary
+ * call) live in _shared/timing.ts next to the worker's budget, so the caps this
+ * file aborts at are the SAME ones worstCaseSegmentMs() sums against the 150 s
+ * gateway kill. STATUS_TIMEOUT_MS / DELETE_TIMEOUT_MS stay local: a single
+ * files.get poll and a best-effort delete, neither part of the segment ceiling.
  */
-const UPLOAD_TIMEOUT_MS = 60_000;   // the WHOLE GCS -> Gemini transfer
 const STATUS_TIMEOUT_MS = 10_000;   // one files.get poll
-const GENERATE_TIMEOUT_MS = 120_000; // one generateContent call
-const DELETE_TIMEOUT_MS = 10_000;
+const DELETE_TIMEOUT_MS = 10_000;   // best-effort file cleanup
 
 /** Output cap for a transcription call: ~10 min of speech needs far less. */
 const TRANSCRIBE_MAX_OUTPUT_TOKENS = 16384;
@@ -161,8 +163,15 @@ function geminiFileName(fileUri: string): string {
 }
 
 /**
- * Poll a freshly uploaded file until it reports ACTIVE. Bounded by capMs so
- * the caller stays well inside its own request budget.
+ * Poll a freshly uploaded file until it reports ACTIVE, HARD-bounded by capMs.
+ *
+ * The cap is not a loop-top soft check: both the per-poll fetch timeout AND the
+ * inter-poll sleep are clamped to what is LEFT of capMs, so a poll begun at
+ * capMs - epsilon cannot carry the leg past the deadline. Without the clamp the
+ * per-poll STATUS_TIMEOUT_MS (10 s) plus the 2 s sleep let a poll begun near the
+ * cap run the leg ~12 s over — which would make worstCaseSegmentMs()'s
+ * FILE_ACTIVE_CAP_MS term a lie. This keeps the real leg <= capMs (bar json parse
+ * + throw), so the timing model's 20 s ACTIVE-wait term is true.
  */
 export async function waitForGeminiFileActive(
   apiKey: string,
@@ -173,11 +182,26 @@ export async function waitForGeminiFileActive(
   const deadline = Date.now() + capMs;
   let state = "PROCESSING";
 
-  while (Date.now() < deadline) {
-    const resp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`,
-      { signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) }
-    );
+  while (true) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    // Clamp the poll's OWN timeout to the remaining cap budget. min(...) keeps
+    // the normal 10 s status timeout when there is plenty of budget, and shrinks
+    // it to the deadline when there is not.
+    const pollTimeout = Math.min(STATUS_TIMEOUT_MS, remaining);
+    let resp: Response;
+    try {
+      resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/files/${fileName}?key=${apiKey}`,
+        { signal: AbortSignal.timeout(pollTimeout) }
+      );
+    } catch (e) {
+      // Aborted because the CAP ran out mid-poll -> report the ACTIVE-wait
+      // timeout below, not a raw abort. Aborted while budget still remained (a
+      // genuinely hung status endpoint) -> surface it, as before.
+      if (Date.now() >= deadline) break;
+      throw e;
+    }
     if (!resp.ok) {
       const err = await resp.text();
       throw new Error(`Failed to check file status: ${err}`);
@@ -186,7 +210,11 @@ export async function waitForGeminiFileActive(
     state = data.state;
     if (state === "ACTIVE") return;
     if (state === "FAILED") throw new Error("Gemini file processing failed");
-    await new Promise((r) => setTimeout(r, 2000));
+    // Clamp the inter-poll sleep so the loop exits AT the deadline, not up to a
+    // full 2 s sleep past it.
+    const sleepFor = Math.min(2000, deadline - Date.now());
+    if (sleepFor <= 0) break;
+    await new Promise((r) => setTimeout(r, sleepFor));
   }
 
   throw new Error(`Gemini file did not become ACTIVE within ${Math.round(capMs / 1000)}s (state: ${state})`);
