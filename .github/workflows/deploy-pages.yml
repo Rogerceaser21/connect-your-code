@@ -73,11 +73,15 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # Pages names each deployment after the commit sha that triggered the run
+      # and silently reuses an existing deployment with the same sha, while the
+      # run still reports success. A fast-forward merge pushes main at the exact
+      # sha the preview branch already deployed, so that main run changes nothing
+      # (v66 2026-09-11, v67 2026-09-12). The sha cannot be overridden here: a
+      # step-level env GITHUB_SHA never reaches the action (runs 34582627243 and
+      # 34692789907 both sent the plain sha). Rule: right after every fast-forward
+      # merge to main, push one new commit to redesign/liquid-glass (an empty
+      # commit is fine). Its run has a fresh sha and rebuilds both channels, the
+      # deployed one from main. Then grep the served index-*.js for the short sha.
       - id: deployment
         uses: actions/deploy-pages@v4
-        # Pages names a deployment by GITHUB_SHA and skips a second deployment that
-        # carries the same name. A fast-forward merge pushes main at the sha the
-        # preview branch already deployed, so the main run "succeeded" without
-        # changing the site (v66, 2026-09-11). Make every run's version unique.
-        env:
-          GITHUB_SHA: ${{ github.sha }}-${{ github.run_id }}
