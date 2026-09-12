@@ -7,6 +7,8 @@
  * the segmented transcription worker.
  */
 
+import { GCS_TIMEOUT_MS } from "./timing.ts";
+
 export interface ServiceAccount {
   client_email: string;
   private_key: string;
@@ -16,9 +18,12 @@ export interface ServiceAccount {
 /**
  * Every GCS leg is bounded so a hung call can never hold a worker (and its
  * request) open indefinitely. This bounds each leg, not the whole segment:
- * ownership of the row is what protects state when a lease expires.
+ * ownership of the row is what protects state when a lease expires. The value
+ * (30 s) lives in _shared/timing.ts, so the worker's worstCaseSegmentMs() sums
+ * the same cap this code actually aborts its fetches at. Re-exported so existing
+ * importers of gcs.ts keep working.
  */
-export const GCS_TIMEOUT_MS = 60_000;
+export { GCS_TIMEOUT_MS };
 
 export async function getGcsAccessToken(sa: ServiceAccount): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
