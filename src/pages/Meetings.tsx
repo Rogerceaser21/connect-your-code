@@ -93,6 +93,9 @@ const PROCESSING_LABELS: Record<string, { label: string; progress: number }> = {
   error: { label: 'Processing failed', progress: 0 },
 };
 
+// The two processing_status values a meeting never leaves once reached.
+const TERMINAL_PROCESSING_STATUSES = new Set(['done', 'error']);
+
 const Meetings = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -196,6 +199,14 @@ const Meetings = () => {
   // question directly - one 400 per mount, never one per tick. Once the column exists
   // the wide select simply succeeds and this stays false.
   const noSegmentsColumnRef = useRef(false);
+  // Ids the status poll has itself confirmed 'done' or 'error' for, in THIS
+  // session — so a racing/stale list refetch (a react-query cache serving
+  // stale-while-fresh, a network read that started before the poll's own
+  // patch landed) can never resurrect that exact row back to a "processing"
+  // pill (MT8). Cleared the moment a NEW poll cycle starts for the same id
+  // (fresh recording, Retry, orphan recovery), so a genuine restart is never
+  // blocked by an earlier completion.
+  const pollConfirmedTerminalRef = useRef<Set<string>>(new Set());
 
   // Meeting sharing info: receiverMeetingId -> { sender name }
   const [meetingSharingMap, setMeetingSharingMap] = useState<Record<string, { name: string }>>({});
@@ -351,6 +362,10 @@ const Meetings = () => {
   // Polling for async processing
   useEffect(() => {
     if (!processingMeetingId) return;
+    // A fresh poll cycle (new recording, Retry, orphan recovery) always trusts
+    // the server again — drop any earlier "this id is done/error" mark so a
+    // genuine restart is never blocked by the applyMeetings guard below.
+    pollConfirmedTerminalRef.current.delete(processingMeetingId);
 
     const poll = async () => {
       const read = (withSegments: boolean) =>
@@ -358,11 +373,11 @@ const Meetings = () => {
           .from('focusos_meetings')
           .select(
             withSegments
-              ? 'processing_status, processing_error, transcript_segments'
-              : 'processing_status, processing_error',
+              ? 'processing_status, processing_error, transcript_segments, summary, duration_seconds'
+              : 'processing_status, processing_error, summary, duration_seconds',
           )
           .eq('id', processingMeetingId)
-          .single();
+          .maybeSingle();
 
       let { data, error } = await read(!noSegmentsColumnRef.current);
 
@@ -378,28 +393,71 @@ const Meetings = () => {
         ({ data, error } = await read(false));
       }
 
-      if (error || !data) return;
+      // maybeSingle() never errors on "0 rows" — a real error (network, RLS, an
+      // unexpected 4xx/5xx) is logged instead of silently stalling forever: a
+      // swallowed tick used to look identical to a healthy one with nothing new
+      // to say, and the banner/card just spun for good (MT8).
+      if (error) {
+        console.warn('[Meetings] status poll failed for', processingMeetingId, error);
+        return;
+      }
+      if (!data) {
+        console.warn('[Meetings] status poll found no row for', processingMeetingId);
+        return;
+      }
 
-      const status = (data as any).processing_status as string;
-      const procError = (data as any).processing_error as string | null;
-
-      setProcessingStatus(status);
+      // One narrow cast for the whole payload instead of one `as any` per field
+      // (keeps this tick no worse on @typescript-eslint/no-explicit-any than
+      // before the fix).
+      const row = data as {
+        processing_status: string;
+        processing_error: string | null;
+        transcript_segments?: TranscriptSegments | null;
+        summary?: string | null;
+        duration_seconds?: number;
+      };
+      const status = row.processing_status;
+      const procError = row.processing_error;
       // Segment ledger -> "Transcribing 3/8". Null whenever the worker has not
       // planned the run yet, which is also what clears the count on the way out
       // of 'transcribing'.
-      setProcessingProgress(segmentProgress((data as any).transcript_segments));
+      const progress = segmentProgress(row.transcript_segments);
+
+      setProcessingStatus(status);
+      setProcessingProgress(progress);
+
+      // The LIST CARD's own pill reads meeting.processing_status /
+      // meeting.transcript_segments straight off the `meetings` array — never
+      // off the two banner-only state variables above — so every tick must
+      // patch this meeting's row too, or the card stays frozen at whatever
+      // fetchMeetings last saw until a page reload (MT8's "stuck at 8/8").
+      // summary/duration_seconds ride along so a 'done' tick flips the row
+      // straight to its normal finished-card shape, with nothing extra to wait on.
+      patchMeetingRow(processingMeetingId, {
+        processing_status: status,
+        processing_error: procError,
+        transcript_segments: row.transcript_segments ?? null,
+        summary: row.summary ?? null,
+        duration_seconds: typeof row.duration_seconds === 'number' ? row.duration_seconds : 0,
+      });
 
       if (status === 'done') {
         if (pollingRef.current) clearInterval(pollingRef.current);
         pollingRef.current = null;
-        toast.success('Meeting processed successfully!');
-        navigate(`/meetings/${processingMeetingId}`);
+        pollConfirmedTerminalRef.current.add(processingMeetingId);
+        toast.success('Meeting ready');
         setProcessingMeetingId(null);
         setProcessingProgress(null);
         setRecordingState('idle');
+        // Igor's word, 2026-09-12: stay on the list — the row above already
+        // flipped to its finished state this same tick. fresh:true so this
+        // truing-up (exact summary shape, action items) can never serve a
+        // stale cached snapshot back over the row the poll just patched.
+        fetchMeetings({ quiet: true, fresh: true });
       } else if (status === 'error') {
         if (pollingRef.current) clearInterval(pollingRef.current);
         pollingRef.current = null;
+        pollConfirmedTerminalRef.current.add(processingMeetingId);
         toast.error(`Processing failed: ${procError || 'Unknown error'}`);
         setProcessingMeetingId(null);
         setProcessingProgress(null);
@@ -412,10 +470,20 @@ const Meetings = () => {
     // Initial poll
     poll();
 
+    // Warm-return: a hidden tab's setInterval is throttled (sometimes to a
+    // crawl) by the browser, so a poll due while backgrounded can land
+    // arbitrarily late. Poll immediately the moment the tab is visible again
+    // instead of waiting up to 5s for the next tick (MT8, hidden-tab case).
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') poll();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current);
+      document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [processingMeetingId, navigate]);
+  }, [processingMeetingId]);
 
   // Route through the shared projects cache so an /app <-> /meetings switch within
   // staleTime serves from cache instead of re-hitting the network. The shared fetcher
@@ -508,21 +576,58 @@ const Meetings = () => {
     setOrphanedSession(null);
   };
 
+  // Patch a single row of the rendered meetings list in place (MT8). The
+  // card's pill reads meeting.processing_status / meeting.transcript_segments
+  // straight off this array, so the status poll writes here every tick — not
+  // just its own standalone banner state. No-ops when the row is not in the
+  // list yet (a brand-new meeting from a live recording this page has never
+  // fetched: only the top banner shows for that one, no card to patch).
+  const patchMeetingRow = (id: string, patch: Partial<Meeting>) => {
+    setMeetings(prev => {
+      const idx = prev.findIndex(m => m.id === id);
+      if (idx === -1) return prev;
+      const next = prev.slice();
+      next[idx] = { ...next[idx], ...patch };
+      return next;
+    });
+  };
+
   // Map raw meeting rows into state and, if any are still processing, arm the stuck-meeting
   // poller. Shared by the cached (unfiltered) and the direct (project-filtered) read paths.
+  //
+  // Guard (MT8): a list refetch can race the status poll and resolve with an
+  // OLDER snapshot (a react-query cache serving stale-while-fresh, a network
+  // read that started before the poll's own 'done'/'error' patch landed). For
+  // any row the poll has itself confirmed done/error in this session
+  // (pollConfirmedTerminalRef), such a refetch must never resurrect it back to
+  // a "processing" pill — keep the already-patched row instead. Every other
+  // row is untouched: plain overwrite, same as before.
   const applyMeetings = (data: any[] | null | undefined) => {
     if (!data) return;
-    setMeetings(
-      data.map(m => ({
-        ...m,
-        action_items: Array.isArray(m.action_items) ? m.action_items : [],
-        processing_status: (m as any).processing_status || 'done',
-        processing_error: (m as any).processing_error || null,
-        // Kept explicitly (select('*') returns it) so an in-flight row's card pill
-        // can count segments without waiting for the single-row poll.
-        transcript_segments: (m as any).transcript_segments ?? null,
-      }))
-    );
+    setMeetings(prev => {
+      const prevById = new Map(prev.map(m => [m.id, m]));
+      return data.map(m => {
+        const incoming = {
+          ...m,
+          action_items: Array.isArray(m.action_items) ? m.action_items : [],
+          processing_status: (m as any).processing_status || 'done',
+          processing_error: (m as any).processing_error || null,
+          // Kept explicitly (select('*') returns it) so an in-flight row's card pill
+          // can count segments without waiting for the single-row poll.
+          transcript_segments: (m as any).transcript_segments ?? null,
+        };
+        const existing = prevById.get(m.id);
+        if (
+          existing &&
+          pollConfirmedTerminalRef.current.has(m.id) &&
+          TERMINAL_PROCESSING_STATUSES.has(existing.processing_status) &&
+          !TERMINAL_PROCESSING_STATUSES.has(incoming.processing_status)
+        ) {
+          return existing;
+        }
+        return incoming;
+      });
+    });
 
     // Safety net: if any meetings are still in-flight, ping the poller
     // so it picks back up if its chain ever died.
