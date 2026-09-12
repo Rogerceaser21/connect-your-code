@@ -40,6 +40,13 @@ import {
   segmentsPrefix,
   type SegmentsState,
 } from "../_shared/segments.ts";
+import {
+  BUDGET_MS,
+  canFinalize,
+  canStartSegment,
+  FILE_ACTIVE_CAP_MS,
+  LEASE_MS,
+} from "../_shared/timing.ts";
 
 /**
  * SEGMENT WORKER.
@@ -50,8 +57,8 @@ import {
  * callee keeps running after its caller disconnects — the same behaviour the
  * client already relies on (see triggerTranscription in src/pages/Meetings.tsx:
  * its invoke times out while the server finishes). Nothing awaits the rest of
- * the chain, so no worker is held alive by its successors and no segment
- * inherits the first worker's wall clock.
+ * the chain, so no worker is held alive by its successors and every hop gets its
+ * own fresh ~150 s gateway clock (see _shared/timing.ts).
  *
  * Body: { meetingId, retry? }. Every other field is ignored (old clients still
  * send geminiFileUri / gcsBucket / … — harmless).
@@ -64,26 +71,13 @@ const corsHeaders = {
 };
 
 const SEGMENT_CHUNKS = 20;      // 20 x 30 s chunks = 10 min of audio per Gemini call
-// 5 min: above the TYPICAL segment (compose ~2 s + GCS->Gemini upload + ACTIVE
-// wait + generateContent, tens of seconds each). It is NOT above the sum of every
-// leg's timeout cap (a first segment i>0 can spend up to five 60 s GCS legs plus
-// 242 s of Gemini legs), so an owner CAN outlive its lease on a pathologically
-// slow day. Correctness never rests on the lease alone: every state write is
-// token-owned, so an expired owner stands down and at most one segment's Gemini
-// call is repeated.
-const LEASE_MS = 300_000;
-// 60 s: a segment may START at the very end of the budget, so the request's own
-// ceiling is BUDGET_MS + one worst-case segment (~242 s) + finalize, which keeps
-// it under the 400 s edge-function wall clock.
-const BUDGET_MS = 60_000;       // stop STARTING segments after this much wall clock
-const FILE_ACTIVE_CAP_MS = 60_000;
-// The edge runtime's own wall clock, and what finalize needs inside it: the
-// summary is one more Gemini call (bounded at 120 s) plus the transcript upload
-// and the artifact cleanup. A request that already spent WALL_CLOCK_MS minus
-// this reserve on segments hands the finalize to a fresh worker rather than
-// being cut off in the middle of it.
-const WALL_CLOCK_MS = 400_000;
-const FINALIZE_RESERVE_MS = 150_000;
+// The worker's timing budget (BUDGET_MS, LEASE_MS, FILE_ACTIVE_CAP_MS) and the
+// per-request start / finalize decisions (canStartSegment / canFinalize) live in
+// _shared/timing.ts, sized against the ~150 s gateway kill — the Supabase edge
+// gateway kills the isolate at ~150 s from request start, NOT the 400 s function
+// wall clock the platform advertises (see memory
+// focusos-meeting-transcription-pipeline). One place so a unit test pins them and
+// so the segment chain's per-leg caps and these budgets cannot drift apart.
 const MAX_SEGMENT_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 5_000; // x attempt number, retry path only
 const KICK_ABORT_MS = 1_500;    // how long we stay connected to the next worker
@@ -738,7 +732,7 @@ serve(async (req) => {
         const next = firstMissingSegment(state.texts, state.total);
         if (next === null) break;
         const elapsed = Date.now() - requestStart;
-        if (elapsed >= BUDGET_MS) {
+        if (!canStartSegment(elapsed)) {
           console.log(
             `[segment ${INSTANCE}] ${meetingId}: budget spent (${Math.round(elapsed / 1000)}s, ` +
             `${processed.length} segment(s) this request) — handing over at segment ${next}`
@@ -782,12 +776,15 @@ serve(async (req) => {
       }
 
       /* ─── f. FINALIZE ────────────────────────────────────────── */
-      // A segment that started at the end of the budget can run for ~4 more
-      // minutes (upload 60 s + ACTIVE 60 s + generate 120 s), which leaves no
-      // room for the summary call. Hand over: the next worker sees zero missing
-      // segments and finalizes immediately with a full wall clock.
+      // Finalize is a further Gemini summary call plus the transcript upload and
+      // artifact cleanup. Begin it only while this request is still early
+      // (canFinalize: elapsed <= 60 s). A request that already spent longer on
+      // segments hands the finalize to a fresh worker, which sees zero missing
+      // segments and finalizes immediately inside its own 150 s gateway clock —
+      // being cut off mid-summary by the gateway kill would otherwise strand the
+      // meeting one call short of done.
       const spentMs = Date.now() - requestStart;
-      if (spentMs > WALL_CLOCK_MS - FINALIZE_RESERVE_MS) {
+      if (!canFinalize(spentMs)) {
         console.log(
           `[segment ${INSTANCE}] ${meetingId}: ${Math.round(spentMs / 1000)}s spent — ` +
           `handing the finalize to a fresh worker`
