@@ -443,9 +443,20 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
   test('(c2) an in-flight list card counts segments off its own row', async ({ page, request }) => {
     test.setTimeout(120_000);
     // Seeded mid-transcription, so the card renders the processing pill and never
-    // the Failed one — this case never touches Retry or the single-row poll.
+    // the Failed one — this case never touches Retry. The mount-time adoption
+    // (case i) does start the single-row poll for this row, and every tick
+    // patches the list row from the poll payload, so that poll is served the
+    // SAME ledger the list route fabricates below — as the live table would:
+    // the DB row and the list row are one row and can never disagree.
     await withSeededMeeting(request, async ({ title }) => {
       await stubFunctions(page);
+      await routeStatusPoll(page, (route) => fulfilJson(route, {
+        processing_status: 'transcribing',
+        processing_error: null,
+        transcript_segments: { total: 8, texts: { '0': 'a', '1': 'b', '2': 'c' } },
+        summary: null,
+        duration_seconds: SEED_DURATION,
+      }));
 
       // applyMeetings must carry transcript_segments through onto the mapped row.
       // The rest of the list read stays real; only this run's row is rewritten.
@@ -820,6 +831,80 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
       // not a navigation that just hadn't fired yet.
       await page.waitForTimeout(6000);
       await expect(pillOf(card)).toHaveCount(0);
+      await expect(page).toHaveURL(/\/meetings$/);
+    }, { processing_status: 'transcribing', processing_error: null });
+  });
+
+  test('(j) a tab coming back to the foreground polls at once and keeps its in-flight row', async ({ page, request }) => {
+    test.setTimeout(120_000);
+    // Warm return: a hidden tab's timers crawl, so the client polls the instant
+    // visibilityState flips back to 'visible' (Meetings.tsx onVisible). Headless
+    // Chromium never really backgrounds a page, so the transition is synthesised:
+    // the visibilityState getter is overridden and a GENUINE visibilitychange
+    // event is dispatched — the listener cannot tell the difference.
+    await withSeededMeeting(request, async ({ title }) => {
+      await stubFunctions(page);
+
+      const staleSegments = { total: 8, texts: { '0': 'a', '1': 'b', '2': 'c' } };
+      await page.route(
+        (url) => isMeetingList(url.href),
+        async (route) => {
+          const response = await route.fetch();
+          const rows = (await response.json()) as Array<Record<string, unknown>>;
+          const patched = Array.isArray(rows)
+            ? rows.map((r) => (r.title === title
+              ? { ...r, processing_status: 'transcribing', processing_error: null, transcript_segments: staleSegments }
+              : r))
+            : rows;
+          await route.fulfill({ response, json: patched });
+        },
+      );
+
+      let pollStatus = 'transcribing';
+      let segments: unknown = staleSegments;
+      await routeStatusPoll(page, (route) => fulfilJson(route, {
+        processing_status: pollStatus,
+        processing_error: null,
+        transcript_segments: segments,
+        summary: pollStatus === 'done' ? 'zz warm-return summary' : null,
+        duration_seconds: SEED_DURATION,
+      }));
+      const isPollGet = (req: { url(): string; method(): string }) => isStatusPoll(req.url()) && req.method() === 'GET';
+
+      await signIn(page);
+      const card = await openMeetings(page, title);
+      await expect(pillOf(card)).toHaveText('Transcribing 3/8', { timeout: 30000 });
+      await page.waitForRequest(isPollGet, { timeout: 30000 });
+
+      const setVisibility = (state: 'hidden' | 'visible') => page.evaluate((s) => {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => s });
+        Object.defineProperty(document, 'hidden', { configurable: true, get: () => s === 'hidden' });
+        document.dispatchEvent(new Event('visibilitychange'));
+      }, state);
+
+      // Go hidden. Nothing that fires on a visibility change may clear the
+      // in-flight row: the pill must still be counting when we come back.
+      await setVisibility('hidden');
+      await page.waitForTimeout(1500);
+      await expect(pillOf(card)).toHaveText('Transcribing 3/8');
+
+      // Come back with the row now done. Sync to an interval tick first so the
+      // next scheduled poll is ~5 s away: a poll GET inside 1.5 s of the event
+      // can only be the catch-up poll, never a coincidental tick.
+      segments = {
+        total: 8,
+        texts: { '0': 'a', '1': 'b', '2': 'c', '3': 'd', '4': 'e', '5': 'f', '6': 'g', '7': 'h' },
+      };
+      pollStatus = 'done';
+      await page.waitForRequest(isPollGet, { timeout: 10000 });
+      const catchUp = page.waitForRequest(isPollGet, { timeout: 1500 });
+      await setVisibility('visible');
+      await catchUp;
+
+      await expect(
+        page.locator('[data-sonner-toast]', { hasText: 'Meeting ready' }),
+      ).toBeVisible({ timeout: 10000 });
+      await expect(pillOf(card)).toHaveCount(0, { timeout: 10000 });
       await expect(page).toHaveURL(/\/meetings$/);
     }, { processing_status: 'transcribing', processing_error: null });
   });
