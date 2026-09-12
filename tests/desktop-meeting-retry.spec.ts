@@ -1,4 +1,10 @@
 // Retry re-triggers the SEGMENTED transcriber, and the page counts segments (MT2).
+// Cases (b)/(f)/(h) also cover the in-place list-card update on completion (MT8):
+// the card used to stay on "Transcribing N/N" until a page refresh because the
+// status poll only ever wrote its own standalone banner state, never the
+// `meetings` list row the card's pill actually reads. Per Igor's word
+// (2026-09-12): on 'done' the app stays on the list, the row flips to its
+// finished state in place, and a "Meeting ready" toast appears — no navigation.
 //
 // What broke: /meetings' Retry button was written for the old one-shot Gemini
 // flow. It only fired when the row still carried a `gemini_file_uri`, and told
@@ -31,8 +37,9 @@
 //
 // Cases:
 //   (b) a Failed card retries: the invoke body deep-equals { meetingId, retry: true },
-//       the row really is reset to transcribing / null error / 0 attempts, and once the
-//       served poll says 'done' the banner leaves and the page lands on /meetings/<id>;
+//       the row really is reset to transcribing / null error / 0 attempts, and once
+//       the served poll says 'done' the banner leaves, a "Meeting ready" toast
+//       shows, the card's own pill is gone, and the page STAYS on /meetings (MT8);
 //   (c) the banner counts: "Transcribing 3/8", then "Transcribing..." once the
 //       served ledger goes back to null;
 //   (c2) the list-card pill counts the same way, straight off the row applyMeetings
@@ -41,9 +48,20 @@
 //       sends NO transcribe-meeting request at all, and never raises the banner;
 //   (f) old-backend tolerance: the poll's wide select is answered 400 / 42703 (the
 //       pre-migration table, which has no transcript_segments column), and the client
-//       re-asks the two-column question, keeps polling THAT, and still reaches 'done';
+//       re-asks the two-column question, keeps polling THAT, and still reaches 'done'
+//       — in place, same as (b): "Meeting ready" toast, pill gone, still /meetings;
 //   (g) a reset whose PATCH comes back with no row (204 empty, and again as a 200 [])
-//       is refused exactly like the 403: toast, no invoke, no banner, row untouched.
+//       is refused exactly like the 403: toast, no invoke, no banner, row untouched;
+//   (h) an already-transcribing card flips to done from the poll ALONE: the list
+//       select is frozen serving the stale "transcribing 3/8" row for the whole
+//       case (even the quiet+fresh refetch fired on completion), so the only way
+//       the pill can move is the poll's own per-tick patch onto the `meetings` row.
+//   (i) a COLD mount (no click, no live recording in this tab) on a row already
+//       'transcribing' adopts the client poll on its own: a skeptic-found gap
+//       where processingMeetingId was only ever set by a new recording, Retry
+//       or orphan recovery IN THE SAME MOUNT, so a page reload or an
+//       /app -> /meetings navigation that served an in-flight row from a prior
+//       mount's cache had NO client poll and stayed frozen until a hard reload.
 // Every case ends in (e): the seeded row is deleted, 0 zz meetings are left, and
 // the demo account is back to its 3 projects / 7 tasks baseline with every
 // sort_order and pinned_at null.
@@ -336,12 +354,14 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
       const captured = await stubFunctions(page);
 
       // The poll is scripted from here: 'transcribing' while the retry is being proven,
-      // then 'done' to watch the banner leave. Two-column payload on purpose — that is
-      // the shape the pre-migration table can actually answer (see (f)).
+      // then 'done' to watch the card flip in place. summary/duration_seconds only
+      // show up once done, matching what the real worker writes.
       let pollStatus = 'transcribing';
       await routeStatusPoll(page, (route) => fulfilJson(route, {
         processing_status: pollStatus,
         processing_error: null,
+        summary: pollStatus === 'done' ? 'zz retried meeting summary' : null,
+        duration_seconds: SEED_DURATION,
       }));
 
       await signIn(page);
@@ -375,10 +395,20 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
       });
 
       // ...and the banner does not spin for ever: the first poll that reads 'done'
-      // navigates to the meeting and takes the label with it.
+      // flips the card in place — Igor's word, 2026-09-12: no navigation away
+      // from the list, a "Meeting ready" toast, the pill just gone (MT8).
       pollStatus = 'done';
-      await page.waitForURL(`**/meetings/${meetingId}`, { timeout: 30000 });
+      await expect(
+        page.locator('[data-sonner-toast]', { hasText: 'Meeting ready' }),
+      ).toBeVisible({ timeout: 30000 });
       await expect(bannerLabel(page)).toHaveCount(0, { timeout: 10000 });
+      await expect(pillOf(card)).toHaveCount(0, { timeout: 10000 });
+
+      // Held: this must still be the list a few seconds later, not a navigation
+      // that just hadn't fired yet.
+      await page.waitForTimeout(3000);
+      await expect(page).toHaveURL(/\/meetings$/);
+      await expect(pillOf(card)).toHaveCount(0);
     });
   });
 
@@ -413,9 +443,20 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
   test('(c2) an in-flight list card counts segments off its own row', async ({ page, request }) => {
     test.setTimeout(120_000);
     // Seeded mid-transcription, so the card renders the processing pill and never
-    // the Failed one — this case never touches Retry or the single-row poll.
+    // the Failed one — this case never touches Retry. The mount-time adoption
+    // (case i) does start the single-row poll for this row, and every tick
+    // patches the list row from the poll payload, so that poll is served the
+    // SAME ledger the list route fabricates below — as the live table would:
+    // the DB row and the list row are one row and can never disagree.
     await withSeededMeeting(request, async ({ title }) => {
       await stubFunctions(page);
+      await routeStatusPoll(page, (route) => fulfilJson(route, {
+        processing_status: 'transcribing',
+        processing_error: null,
+        transcript_segments: { total: 8, texts: { '0': 'a', '1': 'b', '2': 'c' } },
+        summary: null,
+        duration_seconds: SEED_DURATION,
+      }));
 
       // applyMeetings must carry transcript_segments through onto the mapped row.
       // The rest of the list read stays real; only this run's row is rewritten.
@@ -517,7 +558,12 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
           }, 400);
         }
         narrowHits += 1;
-        return fulfilJson(route, { processing_status: narrowStatus, processing_error: null });
+        return fulfilJson(route, {
+          processing_status: narrowStatus,
+          processing_error: null,
+          summary: narrowStatus === 'done' ? 'zz pre-migration summary' : null,
+          duration_seconds: SEED_DURATION,
+        });
       });
 
       await signIn(page);
@@ -552,10 +598,19 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
       }).toBeGreaterThanOrEqual(3);
       expect(wideHits, 'the wide select must be tried once and never again').toBe(1);
 
-      // ...and the poll still reaches its exit: done -> navigate, banner gone.
+      // ...and the poll still reaches its exit on the narrow select alone: the
+      // card flips in place, same as (b) — no navigation, "Meeting ready" toast,
+      // pill gone (MT8).
       narrowStatus = 'done';
-      await page.waitForURL(`**/meetings/${meetingId}`, { timeout: 30000 });
+      await expect(
+        page.locator('[data-sonner-toast]', { hasText: 'Meeting ready' }),
+      ).toBeVisible({ timeout: 30000 });
       await expect(bannerLabel(page)).toHaveCount(0, { timeout: 10000 });
+      await expect(pillOf(card)).toHaveCount(0, { timeout: 10000 });
+
+      await page.waitForTimeout(3000);
+      await expect(page).toHaveURL(/\/meetings$/);
+      await expect(pillOf(card)).toHaveCount(0);
     });
   });
 
@@ -635,5 +690,222 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
         gemini_transcribe_attempts: SEED_ATTEMPTS,
       });
     });
+  });
+
+  test('(h) the list card flips in place from the poll alone, no list refetch involved', async ({ page, request }) => {
+    test.setTimeout(120_000);
+    // Seeded already mid-transcription, same shape as (c2) — Retry is only the
+    // hook this spec uses to make the page start polling THIS meeting id
+    // client-side; the row was already 'transcribing' before it is clicked.
+    await withSeededMeeting(request, async ({ title }) => {
+      await stubFunctions(page);
+
+      const staleSegments = { total: 8, texts: { '0': 'a', '1': 'b', '2': 'c' } };
+
+      // The list select is FROZEN on this exact stale "3/8" row for the WHOLE
+      // case — including the quiet+fresh refetch the app fires right after
+      // 'done'. If anything other than the poll's own per-row patch were what
+      // flipped the pill, this frozen read would drag it straight back.
+      await page.route(
+        (url) => isMeetingList(url.href),
+        async (route) => {
+          const response = await route.fetch();
+          const rows = (await response.json()) as Array<Record<string, unknown>>;
+          const patched = Array.isArray(rows)
+            ? rows.map((r) => (r.title === title
+              ? { ...r, processing_status: 'transcribing', processing_error: null, transcript_segments: staleSegments }
+              : r))
+            : rows;
+          await route.fulfill({ response, json: patched });
+        },
+      );
+
+      let pollStatus = 'transcribing';
+      let segments: unknown = staleSegments;
+      await routeStatusPoll(page, (route) => fulfilJson(route, {
+        processing_status: pollStatus,
+        processing_error: null,
+        transcript_segments: segments,
+        summary: pollStatus === 'done' ? 'zz poll-only summary' : null,
+        duration_seconds: SEED_DURATION,
+      }));
+
+      await signIn(page);
+      const card = await openMeetings(page, title);
+      await expect(pillOf(card)).toHaveText('Transcribing 3/8', { timeout: 30000 });
+
+      // Kick off the client-side poll for this exact row (the reset PATCH lands
+      // for real; the frozen list select and the scripted poll above are what
+      // the page actually reads back from here).
+      await card.locator('[title="Retry processing"]').click();
+      await expect(pillOf(card)).toHaveText('Transcribing 3/8', { timeout: 30000 });
+
+      // Drive the SAME meeting straight to done through the poll only.
+      segments = {
+        total: 8,
+        texts: { '0': 'a', '1': 'b', '2': 'c', '3': 'd', '4': 'e', '5': 'f', '6': 'g', '7': 'h' },
+      };
+      pollStatus = 'done';
+
+      await expect(
+        page.locator('[data-sonner-toast]', { hasText: 'Meeting ready' }),
+      ).toBeVisible({ timeout: 30000 });
+      await expect(pillOf(card)).toHaveCount(0, { timeout: 10000 });
+
+      // Held: the list select keeps insisting the row is stuck at "transcribing
+      // 3/8" underneath — if applyMeetings' plain overwrite were still in play
+      // the very next quiet+fresh refetch would drag the pill straight back.
+      await page.waitForTimeout(6000);
+      await expect(pillOf(card)).toHaveCount(0);
+      await expect(page).toHaveURL(/\/meetings$/);
+    }, { processing_status: 'transcribing', processing_error: null });
+  });
+
+  test('(i) a cold mount adopts the poll for an already-transcribing row, no click needed', async ({ page, request }) => {
+    test.setTimeout(120_000);
+    // Seeded already mid-transcription — same shape as (c2)/(h) — but this case
+    // never touches Retry or any other control that sets processingMeetingId
+    // itself. The only trigger allowed is page.goto('/meetings') landing fresh:
+    // exactly the "page reload, or an /app -> /meetings mount that reuses a
+    // cached list" gap the skeptic found in applyMeetings.
+    await withSeededMeeting(request, async ({ title }) => {
+      await stubFunctions(page);
+
+      const staleSegments = { total: 8, texts: { '0': 'a', '1': 'b', '2': 'c' } };
+
+      // The list select stays frozen on this exact stale "3/8" row for the WHOLE
+      // case, including the quiet+fresh refetch fired on completion. If the pill
+      // ever moves, it can only be the poll's own per-row patch — proving the
+      // poll itself was started by the mount, with nothing else in play.
+      await page.route(
+        (url) => isMeetingList(url.href),
+        async (route) => {
+          const response = await route.fetch();
+          const rows = (await response.json()) as Array<Record<string, unknown>>;
+          const patched = Array.isArray(rows)
+            ? rows.map((r) => (r.title === title
+              ? { ...r, processing_status: 'transcribing', processing_error: null, transcript_segments: staleSegments }
+              : r))
+            : rows;
+          await route.fulfill({ response, json: patched });
+        },
+      );
+
+      let pollStatus = 'transcribing';
+      let segments: unknown = staleSegments;
+      await routeStatusPoll(page, (route) => fulfilJson(route, {
+        processing_status: pollStatus,
+        processing_error: null,
+        transcript_segments: segments,
+        summary: pollStatus === 'done' ? 'zz cold-mount summary' : null,
+        duration_seconds: SEED_DURATION,
+      }));
+
+      // Armed BEFORE the mount: proves the single-row poll fires with no click
+      // and no live recording in this tab at all — pure mount-time adoption.
+      const firstPoll = page.waitForRequest(
+        (req) => isStatusPoll(req.url()) && req.method() === 'GET',
+        { timeout: 30000 },
+      );
+
+      await signIn(page);
+      const card = await openMeetings(page, title);
+      await expect(pillOf(card)).toHaveText('Transcribing 3/8', { timeout: 30000 });
+      await firstPoll;
+
+      // No control was ever clicked. Drive the SAME meeting straight to done
+      // through the poll alone.
+      segments = {
+        total: 8,
+        texts: { '0': 'a', '1': 'b', '2': 'c', '3': 'd', '4': 'e', '5': 'f', '6': 'g', '7': 'h' },
+      };
+      pollStatus = 'done';
+
+      await expect(
+        page.locator('[data-sonner-toast]', { hasText: 'Meeting ready' }),
+      ).toBeVisible({ timeout: 30000 });
+      await expect(pillOf(card)).toHaveCount(0, { timeout: 10000 });
+
+      // Held: the frozen list select keeps insisting the row is stuck at
+      // "transcribing 3/8" underneath, and the page must still be the list —
+      // not a navigation that just hadn't fired yet.
+      await page.waitForTimeout(6000);
+      await expect(pillOf(card)).toHaveCount(0);
+      await expect(page).toHaveURL(/\/meetings$/);
+    }, { processing_status: 'transcribing', processing_error: null });
+  });
+
+  test('(j) a tab coming back to the foreground polls at once and keeps its in-flight row', async ({ page, request }) => {
+    test.setTimeout(120_000);
+    // Warm return: a hidden tab's timers crawl, so the client polls the instant
+    // visibilityState flips back to 'visible' (Meetings.tsx onVisible). Headless
+    // Chromium never really backgrounds a page, so the transition is synthesised:
+    // the visibilityState getter is overridden and a GENUINE visibilitychange
+    // event is dispatched — the listener cannot tell the difference.
+    await withSeededMeeting(request, async ({ title }) => {
+      await stubFunctions(page);
+
+      const staleSegments = { total: 8, texts: { '0': 'a', '1': 'b', '2': 'c' } };
+      await page.route(
+        (url) => isMeetingList(url.href),
+        async (route) => {
+          const response = await route.fetch();
+          const rows = (await response.json()) as Array<Record<string, unknown>>;
+          const patched = Array.isArray(rows)
+            ? rows.map((r) => (r.title === title
+              ? { ...r, processing_status: 'transcribing', processing_error: null, transcript_segments: staleSegments }
+              : r))
+            : rows;
+          await route.fulfill({ response, json: patched });
+        },
+      );
+
+      let pollStatus = 'transcribing';
+      let segments: unknown = staleSegments;
+      await routeStatusPoll(page, (route) => fulfilJson(route, {
+        processing_status: pollStatus,
+        processing_error: null,
+        transcript_segments: segments,
+        summary: pollStatus === 'done' ? 'zz warm-return summary' : null,
+        duration_seconds: SEED_DURATION,
+      }));
+      const isPollGet = (req: { url(): string; method(): string }) => isStatusPoll(req.url()) && req.method() === 'GET';
+
+      await signIn(page);
+      const card = await openMeetings(page, title);
+      await expect(pillOf(card)).toHaveText('Transcribing 3/8', { timeout: 30000 });
+      await page.waitForRequest(isPollGet, { timeout: 30000 });
+
+      const setVisibility = (state: 'hidden' | 'visible') => page.evaluate((s) => {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => s });
+        Object.defineProperty(document, 'hidden', { configurable: true, get: () => s === 'hidden' });
+        document.dispatchEvent(new Event('visibilitychange'));
+      }, state);
+
+      // Go hidden. Nothing that fires on a visibility change may clear the
+      // in-flight row: the pill must still be counting when we come back.
+      await setVisibility('hidden');
+      await page.waitForTimeout(1500);
+      await expect(pillOf(card)).toHaveText('Transcribing 3/8');
+
+      // Come back with the row now done. Sync to an interval tick first so the
+      // next scheduled poll is ~5 s away: a poll GET inside 1.5 s of the event
+      // can only be the catch-up poll, never a coincidental tick.
+      segments = {
+        total: 8,
+        texts: { '0': 'a', '1': 'b', '2': 'c', '3': 'd', '4': 'e', '5': 'f', '6': 'g', '7': 'h' },
+      };
+      pollStatus = 'done';
+      await page.waitForRequest(isPollGet, { timeout: 10000 });
+      const catchUp = page.waitForRequest(isPollGet, { timeout: 1500 });
+      await setVisibility('visible');
+      await catchUp;
+
+      await expect(
+        page.locator('[data-sonner-toast]', { hasText: 'Meeting ready' }),
+      ).toBeVisible({ timeout: 10000 });
+      await expect(pillOf(card)).toHaveCount(0, { timeout: 10000 });
+      await expect(page).toHaveURL(/\/meetings$/);
+    }, { processing_status: 'transcribing', processing_error: null });
   });
 });
