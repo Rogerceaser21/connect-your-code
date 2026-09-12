@@ -207,6 +207,17 @@ const Meetings = () => {
   // (fresh recording, Retry, orphan recovery), so a genuine restart is never
   // blocked by an earlier completion.
   const pollConfirmedTerminalRef = useRef<Set<string>>(new Set());
+  // Mirrors processingMeetingId for read access from applyMeetings, which is a
+  // plain closure that can run from a fetchMeetings call whose own closure was
+  // captured on an earlier render (the mount effect, in particular) — a stale
+  // `processingMeetingId` read there would never see a poll started afterwards.
+  // Skeptic finding (2026-09-12): a row already 'transcribing'/'summarizing'
+  // when the list loads (page reload, or an /app -> /meetings mount that reuses
+  // a cached list within APP_DATA_STALE_TIME) had NO client poll adopt it —
+  // only the server-side safety net below, which never touches this tab's UI —
+  // so the card sat frozen until a hard reload ran a fresh mount. This ref lets
+  // applyMeetings always read the CURRENT value.
+  const processingMeetingIdRef = useRef<string | null>(null);
 
   // Meeting sharing info: receiverMeetingId -> { sender name }
   const [meetingSharingMap, setMeetingSharingMap] = useState<Record<string, { name: string }>>({});
@@ -215,6 +226,7 @@ const Meetings = () => {
   useEffect(() => { meetingNameRef.current = meetingName; }, [meetingName]);
   useEffect(() => { participantsRef.current = participants; }, [participants]);
   useEffect(() => { recordingSecondsRef.current = recordingSeconds; }, [recordingSeconds]);
+  useEffect(() => { processingMeetingIdRef.current = processingMeetingId; }, [processingMeetingId]);
 
   useEffect(() => {
     if (!authLoading && !user) {
@@ -638,6 +650,26 @@ const Meetings = () => {
       supabase.functions
         .invoke('focusos-poll-stuck-meetings', { body: { chainCount: 0 } })
         .catch((e) => console.warn('arm-on-load poller invoke failed:', e?.message));
+    }
+
+    // Adopt an in-flight row with no client poll of its own (skeptic finding,
+    // 2026-09-12): a page reload, or an /app -> /meetings mount that lands
+    // after the poll's previous owner unmounted, can serve a list whose top
+    // row is already 'transcribing'/'summarizing' while processingMeetingId
+    // is still null in THIS mount — the ping above only reaches the server,
+    // never this tab's poll effect. Only ever adopt when nothing is already
+    // being polled, and never re-adopt a row this session already confirmed
+    // done/error (a stale cached list re-served after this tab moved on).
+    // Rows are already newest-first, so the first match is the most recent.
+    if (!processingMeetingIdRef.current) {
+      const toAdopt = data.find(
+        (m) =>
+          (m.processing_status === 'transcribing' || m.processing_status === 'summarizing') &&
+          !pollConfirmedTerminalRef.current.has(m.id)
+      );
+      if (toAdopt) {
+        setProcessingMeetingId(toAdopt.id);
+      }
     }
   };
 

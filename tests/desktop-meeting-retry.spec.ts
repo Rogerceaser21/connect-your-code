@@ -56,6 +56,12 @@
 //       select is frozen serving the stale "transcribing 3/8" row for the whole
 //       case (even the quiet+fresh refetch fired on completion), so the only way
 //       the pill can move is the poll's own per-tick patch onto the `meetings` row.
+//   (i) a COLD mount (no click, no live recording in this tab) on a row already
+//       'transcribing' adopts the client poll on its own: a skeptic-found gap
+//       where processingMeetingId was only ever set by a new recording, Retry
+//       or orphan recovery IN THE SAME MOUNT, so a page reload or an
+//       /app -> /meetings navigation that served an in-flight row from a prior
+//       mount's cache had NO client poll and stayed frozen until a hard reload.
 // Every case ends in (e): the seeded row is deleted, 0 zz meetings are left, and
 // the demo account is back to its 3 projects / 7 tasks baseline with every
 // sort_order and pinned_at null.
@@ -738,6 +744,80 @@ test.describe('meeting Retry drives the segmented transcriber (MT2)', () => {
       // Held: the list select keeps insisting the row is stuck at "transcribing
       // 3/8" underneath — if applyMeetings' plain overwrite were still in play
       // the very next quiet+fresh refetch would drag the pill straight back.
+      await page.waitForTimeout(6000);
+      await expect(pillOf(card)).toHaveCount(0);
+      await expect(page).toHaveURL(/\/meetings$/);
+    }, { processing_status: 'transcribing', processing_error: null });
+  });
+
+  test('(i) a cold mount adopts the poll for an already-transcribing row, no click needed', async ({ page, request }) => {
+    test.setTimeout(120_000);
+    // Seeded already mid-transcription — same shape as (c2)/(h) — but this case
+    // never touches Retry or any other control that sets processingMeetingId
+    // itself. The only trigger allowed is page.goto('/meetings') landing fresh:
+    // exactly the "page reload, or an /app -> /meetings mount that reuses a
+    // cached list" gap the skeptic found in applyMeetings.
+    await withSeededMeeting(request, async ({ title }) => {
+      await stubFunctions(page);
+
+      const staleSegments = { total: 8, texts: { '0': 'a', '1': 'b', '2': 'c' } };
+
+      // The list select stays frozen on this exact stale "3/8" row for the WHOLE
+      // case, including the quiet+fresh refetch fired on completion. If the pill
+      // ever moves, it can only be the poll's own per-row patch — proving the
+      // poll itself was started by the mount, with nothing else in play.
+      await page.route(
+        (url) => isMeetingList(url.href),
+        async (route) => {
+          const response = await route.fetch();
+          const rows = (await response.json()) as Array<Record<string, unknown>>;
+          const patched = Array.isArray(rows)
+            ? rows.map((r) => (r.title === title
+              ? { ...r, processing_status: 'transcribing', processing_error: null, transcript_segments: staleSegments }
+              : r))
+            : rows;
+          await route.fulfill({ response, json: patched });
+        },
+      );
+
+      let pollStatus = 'transcribing';
+      let segments: unknown = staleSegments;
+      await routeStatusPoll(page, (route) => fulfilJson(route, {
+        processing_status: pollStatus,
+        processing_error: null,
+        transcript_segments: segments,
+        summary: pollStatus === 'done' ? 'zz cold-mount summary' : null,
+        duration_seconds: SEED_DURATION,
+      }));
+
+      // Armed BEFORE the mount: proves the single-row poll fires with no click
+      // and no live recording in this tab at all — pure mount-time adoption.
+      const firstPoll = page.waitForRequest(
+        (req) => isStatusPoll(req.url()) && req.method() === 'GET',
+        { timeout: 30000 },
+      );
+
+      await signIn(page);
+      const card = await openMeetings(page, title);
+      await expect(pillOf(card)).toHaveText('Transcribing 3/8', { timeout: 30000 });
+      await firstPoll;
+
+      // No control was ever clicked. Drive the SAME meeting straight to done
+      // through the poll alone.
+      segments = {
+        total: 8,
+        texts: { '0': 'a', '1': 'b', '2': 'c', '3': 'd', '4': 'e', '5': 'f', '6': 'g', '7': 'h' },
+      };
+      pollStatus = 'done';
+
+      await expect(
+        page.locator('[data-sonner-toast]', { hasText: 'Meeting ready' }),
+      ).toBeVisible({ timeout: 30000 });
+      await expect(pillOf(card)).toHaveCount(0, { timeout: 10000 });
+
+      // Held: the frozen list select keeps insisting the row is stuck at
+      // "transcribing 3/8" underneath, and the page must still be the list —
+      // not a navigation that just hadn't fired yet.
       await page.waitForTimeout(6000);
       await expect(pillOf(card)).toHaveCount(0);
       await expect(page).toHaveURL(/\/meetings$/);
